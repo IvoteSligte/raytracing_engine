@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
 use vulkano::{
+    buffer::{BufferUsage, ImmutableBuffer},
     command_buffer::{
-        AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer,
-        RenderPassBeginInfo, SubpassContents,
+        AutoCommandBufferBuilder,
+        CommandBufferUsage, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassContents,
     },
+    descriptor_set::{DescriptorSetsCollection, PersistentDescriptorSet, WriteDescriptorSet},
     device::{
         physical::{PhysicalDevice, PhysicalDeviceType, QueueFamily},
         Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo,
@@ -15,7 +17,8 @@ use vulkano::{
     pipeline::{
         graphics::{
             input_assembly::InputAssemblyState,
-            viewport::{Viewport, ViewportState}, vertex_input::VertexInputState,
+            vertex_input::VertexInputState,
+            viewport::{Viewport, ViewportState},
         },
         GraphicsPipeline, Pipeline, PipelineBindPoint,
     },
@@ -24,7 +27,8 @@ use vulkano::{
     swapchain::{
         self, AcquireError, Surface, Swapchain, SwapchainCreateInfo, SwapchainCreationError,
     },
-    sync::{self, FenceSignalFuture, FlushError, GpuFuture}, descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet}, buffer::{ImmutableBuffer, BufferUsage},
+    sync::{self, FenceSignalFuture, FlushError, GpuFuture},
+    Version,
 };
 use vulkano_win::VkSurfaceBuild;
 use winit::{
@@ -58,6 +62,10 @@ mod fragment_shader {
         src: "
 #version 460
 
+layout(push_constant) uniform PushConstantData {
+    vec3 pos;
+} pc;
+
 layout(binding = 0) uniform ViewportBuffer {
     vec2 viewport;
 } ubo;
@@ -68,21 +76,21 @@ void main() {
     vec2 normCoord = gl_FragCoord.xy / ubo.viewport - 0.5;
     normCoord.x *= ubo.viewport.x / ubo.viewport.y;
 
-    vec4 light = vec4(4.0, 3.0, 4.0, 100.0); // w = strength
+    vec4 light = vec4(5.0, 0.0, 5.0, 100.0); // w = strength
     vec4 sphere = vec4(0.0, 0.0, 5.0, 2.0); // w = radius
 
     vec3 colorMat = vec3(0.2, 0.2, 1.0);
     float specularMat = 1.0;
     float diffuseMat = 1.0;
-    float shineMat = 100.0;
+    float shineMat = 1.0;
 
     float ambientScene = 0.8;
 
     vec3 fragPos = vec3(normCoord, 1.0);
-    vec3 position = fragPos;
-    vec3 step = normalize(fragPos);
+    vec3 position = pc.pos + fragPos;
+    vec3 step = normalize(fragPos) / 100.0;
 
-    for (uint i = 0; i < 100; i++) {
+    for (uint i = 0; i < 1000; i++) {
         if (distance(position, sphere.xyz) <= sphere.w) {
             vec3 normal = normalize(position - sphere.xyz);
             vec3 lightDir = normalize(light.xyz - position); // might be light.xyz - fragPos
@@ -178,7 +186,7 @@ fn get_graphics_pipeline(
     GraphicsPipeline::start()
         .vertex_input_state(VertexInputState::new())
         .vertex_shader(vertex_shader.entry_point("main").unwrap(), ())
-        .input_assembly_state(InputAssemblyState::new())
+        .input_assembly_state(InputAssemblyState::new()) // might be unnecessary
         .fragment_shader(fragment_shader.entry_point("main").unwrap(), ())
         .viewport_state(ViewportState::viewport_fixed_scissor_irrelevant([viewport]))
         .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
@@ -186,51 +194,72 @@ fn get_graphics_pipeline(
         .unwrap()
 }
 
-fn get_command_buffers(
+fn get_descriptor_set(
+    graphics_pipeline: Arc<GraphicsPipeline>,
+    queue: Arc<Queue>,
+    viewport: Viewport,
+) -> Arc<PersistentDescriptorSet> {
+    let (uniform_buffer, _) = ImmutableBuffer::from_data(
+        viewport.dimensions,
+        BufferUsage::uniform_buffer(),
+        queue.clone(),
+    )
+    .unwrap();
+    PersistentDescriptorSet::new(
+        graphics_pipeline.layout().set_layouts()[0].clone(),
+        [WriteDescriptorSet::buffer(0, uniform_buffer.clone())],
+    )
+    .unwrap()
+}
+
+fn get_primary_command_buffer<S>(
     device: Arc<Device>,
     queue: Arc<Queue>,
     graphics_pipeline: Arc<GraphicsPipeline>,
-    framebuffers: &Vec<Arc<Framebuffer>>,
-    viewport: Viewport,
-) -> Vec<Arc<PrimaryAutoCommandBuffer>> {
-    let (uniform_buffer, _) = ImmutableBuffer::from_data(viewport.dimensions, BufferUsage::uniform_buffer(), queue.clone()).unwrap();
-    let descriptor_set = PersistentDescriptorSet::new(graphics_pipeline.layout().set_layouts()[0].clone(), [WriteDescriptorSet::buffer(0, uniform_buffer.clone())]).unwrap();
+    framebuffer: Arc<Framebuffer>,
+    push_constants: fragment_shader::ty::PushConstantData,
+    descriptor_set: S,
+) -> Arc<PrimaryAutoCommandBuffer>
+where
+    S: DescriptorSetsCollection + Clone,
+{
+    let mut builder = AutoCommandBufferBuilder::primary(
+        device.clone(),
+        queue.family(),
+        CommandBufferUsage::OneTimeSubmit,
+    )
+    .unwrap();
 
-    framebuffers
-        .iter()
-        .map(|framebuffer| {
-            let mut builder = AutoCommandBufferBuilder::primary(
-                device.clone(),
-                queue.family(),
-                CommandBufferUsage::MultipleSubmit,
-            )
-            .unwrap();
+    builder
+        .begin_render_pass(
+            RenderPassBeginInfo {
+                clear_values: vec![Some([0.0, 0.0, 0.0, 1.0].into())],
+                ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
+            },
+            SubpassContents::Inline,
+        )
+        .unwrap()
+        .bind_pipeline_graphics(graphics_pipeline.clone())
+        .push_constants(graphics_pipeline.layout().clone(), 0, push_constants)
+        .bind_descriptor_sets(
+            PipelineBindPoint::Graphics,
+            graphics_pipeline.layout().clone(),
+            0,
+            descriptor_set.clone(),
+        )
+        .draw(3, 1, 0, 0)
+        .unwrap()
+        .end_render_pass()
+        .unwrap();
 
-            builder
-                .begin_render_pass(
-                    RenderPassBeginInfo {
-                        clear_values: vec![Some([0.0, 0.0, 0.0, 1.0].into())],
-                        ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
-                    },
-                    SubpassContents::Inline,
-                )
-                .unwrap()
-                .bind_pipeline_graphics(graphics_pipeline.clone())
-                .bind_descriptor_sets(PipelineBindPoint::Graphics, graphics_pipeline.layout().clone(), 0, descriptor_set.clone())
-                .draw(3, 1, 0, 0)
-                .unwrap()
-                .end_render_pass()
-                .unwrap();
-
-            Arc::new(builder.build().unwrap())
-        })
-        .collect()
+    Arc::new(builder.build().unwrap())
 }
 
 fn main() {
     let required_extensions = vulkano_win::required_extensions();
     let instance = Instance::new(InstanceCreateInfo {
         enabled_extensions: required_extensions,
+        engine_version: Version::V1_3,
         ..Default::default()
     })
     .unwrap();
@@ -297,7 +326,7 @@ fn main() {
 
     let render_pass = get_render_pass(device.clone(), swapchain.clone());
 
-    let framebuffers = get_framebuffers(&images, render_pass.clone());
+    let mut framebuffers = get_framebuffers(&images, render_pass.clone());
 
     let vertex_shader = vertex_shader::load(device.clone()).unwrap();
     let fragment_shader = fragment_shader::load(device.clone()).unwrap();
@@ -308,7 +337,7 @@ fn main() {
         depth_range: 0.0..1.0,
     };
 
-    let graphics_pipeline = get_graphics_pipeline(
+    let mut graphics_pipeline = get_graphics_pipeline(
         device.clone(),
         vertex_shader.clone(),
         fragment_shader.clone(),
@@ -316,13 +345,14 @@ fn main() {
         render_pass.clone(),
     );
 
-    let mut command_buffers = get_command_buffers(
-        device.clone(),
-        queue.clone(),
-        graphics_pipeline,
-        &framebuffers,
-        viewport.clone(),
-    );
+    let mut push_constants = fragment_shader::ty::PushConstantData {
+        pos: [0.0, 0.0, 0.0],
+    };
+
+    let mut descriptor_set =
+        get_descriptor_set(graphics_pipeline.clone(), queue.clone(), viewport.clone());
+
+    let mut command_buffers = vec![None; framebuffers.len()];
 
     let mut fences: Vec<Option<Arc<FenceSignalFuture<_>>>> = vec![None; images.len()];
     let mut previous_fence_index = 0;
@@ -330,6 +360,8 @@ fn main() {
     let mut window_minimized = false;
     let mut window_resized = false;
     let mut recreate_swapchain = false;
+
+    surface.window().set_decorations(false);
 
     event_loop.run(move |event, _, control_flow| match event {
         Event::WindowEvent {
@@ -350,20 +382,41 @@ fn main() {
                 WindowEvent::KeyboardInput {
                     input:
                         KeyboardInput {
-                            virtual_keycode: Some(VirtualKeyCode::F11),
-                            state: ElementState::Pressed,
+                            virtual_keycode: Some(keycode),
+                            state,
                             ..
                         },
                     ..
                 },
             ..
-        } => {
-            let window = surface.window();
-            match window.fullscreen() {
-                Some(_) => window.set_fullscreen(None),
-                None => window.set_fullscreen(Some(Fullscreen::Borderless(None))),
+        } => match (keycode, state) {
+            (VirtualKeyCode::F11, ElementState::Pressed) => {
+                let window = surface.window();
+                match window.fullscreen() {
+                    Some(_) => window.set_fullscreen(None),
+                    None => window.set_fullscreen(Some(Fullscreen::Borderless(None))),
+                }
             }
-        }
+            (VirtualKeyCode::W, ElementState::Pressed) => {
+                push_constants.pos[2] += 1.0;
+            }
+            (VirtualKeyCode::A, ElementState::Pressed) => {
+                push_constants.pos[0] -= 1.0;
+            }
+            (VirtualKeyCode::S, ElementState::Pressed) => {
+                push_constants.pos[2] -= 1.0;
+            }
+            (VirtualKeyCode::D, ElementState::Pressed) => {
+                push_constants.pos[0] += 1.0;
+            }
+            (VirtualKeyCode::Q, ElementState::Pressed) => {
+                push_constants.pos[1] += 1.0;
+            }
+            (VirtualKeyCode::E, ElementState::Pressed) => {
+                push_constants.pos[1] -= 1.0;
+            }
+            _ => (),
+        },
         Event::MainEventsCleared if !window_minimized => {
             if recreate_swapchain || recreate_swapchain {
                 recreate_swapchain = false;
@@ -380,24 +433,24 @@ fn main() {
                 };
                 swapchain = new_swapchain;
 
-                let framebuffers = get_framebuffers(&images, render_pass.clone());
+                framebuffers = get_framebuffers(&images, render_pass.clone());
 
                 if window_resized {
                     window_resized = false;
 
                     viewport.dimensions = dimensions.into();
-                    let graphics_pipeline = get_graphics_pipeline(
+
+                    graphics_pipeline = get_graphics_pipeline(
                         device.clone(),
                         vertex_shader.clone(),
                         fragment_shader.clone(),
                         viewport.clone(),
                         render_pass.clone(),
                     );
-                    command_buffers = get_command_buffers(
-                        device.clone(),
+
+                    descriptor_set = get_descriptor_set(
+                        graphics_pipeline.clone(),
                         queue.clone(),
-                        graphics_pipeline,
-                        &framebuffers,
                         viewport.clone(),
                     );
                 }
@@ -417,6 +470,15 @@ fn main() {
                 image_fence.wait(None).unwrap();
             }
 
+            command_buffers[image_index] = Some(get_primary_command_buffer(
+                device.clone(),
+                queue.clone(),
+                graphics_pipeline.clone(),
+                framebuffers[image_index].clone(),
+                push_constants.clone(),
+                descriptor_set.clone(),
+            ));
+
             let previous_future = match fences[previous_fence_index].clone() {
                 Some(future) => future.boxed(),
                 None => {
@@ -428,7 +490,7 @@ fn main() {
 
             let future = previous_future
                 .join(image_future)
-                .then_execute(queue.clone(), command_buffers[image_index].clone())
+                .then_execute(queue.clone(), command_buffers[image_index].clone().unwrap())
                 .unwrap()
                 .then_swapchain_present(queue.clone(), swapchain.clone(), image_index)
                 .then_signal_fence_and_flush();
