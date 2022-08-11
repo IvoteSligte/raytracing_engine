@@ -5,10 +5,17 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[dependencies.winit_event_helper]
+path = "C:/Users/gebruiker/IdeaProjects/winit_event_helper"
+
 [dependencies]
-vulkano = "0.30.0"
+vulkano = { version = "0.30.0", git = "https://github.com/vulkano-rs/vulkano" }
 vulkano-shaders = "0.30.0"
-vulkano-win = "0.30.0"
+vulkano-win = { git = "https://github.com/vulkano-rs/vulkano" }
 bytemuck = "1.10.0"
 image = "0.24.3"
-winit = "0.26.1"
+winit = "0.27.1"
+winit_input_helper = "0.13.0"
+glam = "0.21.3"
+fps_counter = "2.0.0"
+extend = "1.1.2"
