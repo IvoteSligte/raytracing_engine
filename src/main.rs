@@ -1,7 +1,7 @@
-use std::{sync::Arc, time::Instant, ops::Mul};
+use std::{ops::Mul, sync::Arc, time::Instant};
 
 use extend::ext;
-use glam::{Quat, Vec3, UVec2, Vec2};
+use glam::{DVec2, Quat, UVec2, Vec2, Vec3};
 use vulkano::{
     buffer::{BufferUsage, DeviceLocalBuffer},
     command_buffer::{
@@ -30,13 +30,12 @@ use vulkano::{
         self, AcquireError, Surface, Swapchain, SwapchainCreateInfo, SwapchainCreationError,
     },
     sync::{self, FenceSignalFuture, FlushError, GpuFuture},
-    Version,
-    VulkanLibrary,
+    Version, VulkanLibrary,
 };
 use vulkano_win::VkSurfaceBuild;
 use winit::{
     dpi::PhysicalPosition,
-    event::{Event, VirtualKeyCode, WindowEvent},
+    event::{DeviceEvent, Event, VirtualKeyCode, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::{Fullscreen, Window, WindowBuilder},
 };
@@ -304,15 +303,20 @@ mod rotation {
 fn main() {
     let library = VulkanLibrary::new().unwrap();
     let required_extensions = vulkano_win::required_extensions(&library);
-    let instance = Instance::new(library, InstanceCreateInfo {
-        enabled_extensions: required_extensions,
-        engine_version: Version::V1_3,
-        ..Default::default()
-    })
+    let instance = Instance::new(
+        library,
+        InstanceCreateInfo {
+            enabled_extensions: required_extensions,
+            engine_version: Version::V1_3,
+            ..Default::default()
+        },
+    )
     .unwrap();
 
     let event_loop = EventLoop::new();
-    let surface = WindowBuilder::new().build_vk_surface(&event_loop, instance.clone()).unwrap();
+    let surface = WindowBuilder::new()
+        .build_vk_surface(&event_loop, instance.clone())
+        .unwrap();
     surface.window().set_cursor_visible(false);
 
     let device_extensions = DeviceExtensions {
@@ -407,6 +411,7 @@ fn main() {
     let mut window_center = get_window_center(surface.window());
 
     let mut input_helper = WinitInputHelper::new();
+    let mut cursor_delta = DVec2::ZERO;
 
     #[cfg(debug_assertions)]
     let mut fps_helper = fps_counter::FPSCounter::new();
@@ -417,8 +422,6 @@ fn main() {
     let mut window_frozen = false;
     let mut recreate_swapchain = false;
 
-    // TODO: camera rolls when rotating with mouse
-    // TODO: fix rotation when resizing
     event_loop.run(move |event, _, control_flow| {
         if let Event::WindowEvent {
             event: WindowEvent::Focused(focused),
@@ -426,6 +429,14 @@ fn main() {
         } = event
         {
             window_frozen = !focused;
+        }
+
+        if let Event::DeviceEvent {
+            event: DeviceEvent::MouseMotion { delta: (dx, dy) },
+            ..
+        } = event
+        {
+            cursor_delta += DVec2::new(dx, dy);
         }
 
         if !input_helper.update(&event) {
@@ -444,8 +455,11 @@ fn main() {
             viewport.dimensions = window_center.mul(2.0).to_array();
         }
 
-        surface.window().set_cursor_position(window_center.to_pos()).unwrap();
-        
+        surface
+            .window()
+            .set_cursor_position(window_center.to_pos())
+            .unwrap();
+
         if window_frozen {
             return;
         }
@@ -466,19 +480,17 @@ fn main() {
 
         let mut rotation = Quat::from_array(push_constants.rot);
 
-        if !window_resized {
-            let pos = input_helper
-                .mouse()
-                .map(|(x, y)| Vec2::new(x, y))
-                .unwrap_or(window_center);
-    
-            let mov = (pos - window_center) / Vec2::from_array(viewport.dimensions) * speed::ROTATION;
-            println!("mov: {}, wc: {}, pos: {}", mov, window_center, pos);
-            // yaw
-            rotation *= Quat::from_axis_angle(-rotation::UP, mov.x);
-            // pitch
-            rotation *= Quat::from_axis_angle(rotation::RIGHT, mov.y);
-        }
+        let mov = cursor_delta.as_vec2() / Vec2::from_array(viewport.dimensions)
+            * speed::ROTATION
+            * speed::MOUSE;
+        // yaw
+        rotation *= Quat::from_axis_angle(-rotation::UP, mov.x);
+        println!("{}", Quat::from_axis_angle(-rotation::UP, mov.x));
+        // pitch
+        rotation *= Quat::from_axis_angle(rotation::RIGHT, mov.y);
+        println!("{}", Quat::from_axis_angle(-rotation::RIGHT, mov.y));
+
+        cursor_delta = DVec2::ZERO;
 
         let rot_time = delta_time * speed::ROTATION;
 
@@ -495,6 +507,7 @@ fn main() {
             rotation *= Quat::from_axis_angle(-rotation::RIGHT, rot_time);
         }
 
+        rotation.y = 0.0;
         push_constants.rot = rotation.to_array();
 
         let mov_time = delta_time * speed::MOVEMENT;
