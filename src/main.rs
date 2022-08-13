@@ -1,4 +1,4 @@
-use std::{ops::Mul, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 
 use extend::ext;
 use glam::{DVec2, Quat, UVec2, Vec2, Vec3};
@@ -35,11 +35,11 @@ use vulkano::{
 use vulkano_win::VkSurfaceBuild;
 use winit::{
     dpi::PhysicalPosition,
-    event::{DeviceEvent, Event, VirtualKeyCode, WindowEvent},
+    event::{ElementState, VirtualKeyCode},
     event_loop::{ControlFlow, EventLoop},
-    window::{Fullscreen, Window, WindowBuilder},
+    window::{CursorGrabMode, Fullscreen, Window, WindowBuilder},
 };
-use winit_input_helper::WinitInputHelper;
+use winit_event_helper::EventHelper;
 
 mod vertex_shader {
     vulkano_shaders::shader! {
@@ -279,14 +279,9 @@ where
     Arc::new(builder.build().unwrap())
 }
 
-fn get_window_center(window: &Window) -> Vec2 {
-    let size = window.inner_size();
-    UVec2::new(size.width / 2, size.height / 2).as_vec2()
-}
-
 #[allow(dead_code)]
 mod speed {
-    pub const MOVEMENT: f32 = 2.0;
+    pub const MOVEMENT: f32 = 4.0;
     pub const ROTATION: f32 = 1.0;
     pub const MOUSE: f32 = 1.0;
 }
@@ -298,6 +293,49 @@ mod rotation {
     pub const UP: Vec3 = Vec3::new(0.0, 0.0, 1.0);
     pub const FORWARD: Vec3 = Vec3::new(0.0, 1.0, 0.0);
     pub const RIGHT: Vec3 = Vec3::new(1.0, 0.0, 0.0);
+}
+
+struct Data<W> {
+    surface: Arc<Surface<W>>,
+    window_frozen: bool,
+    window_resized: bool,
+    recreate_swapchain: bool,
+    dimensions: Vec2,
+    cursor_delta: Vec2,
+    position: Vec3,
+    rotation: Quat,
+    last_update: Instant,
+    quit: bool,
+}
+
+impl<W> Data<W> {
+    fn window(&self) -> &W {
+        self.surface.window()
+    }
+
+    fn delta_time(&self) -> f32 {
+        self.last_update.elapsed().as_secs_f32()
+    }
+
+    fn rot_time(&self) -> f32 {
+        self.delta_time() * speed::ROTATION
+    }
+
+    fn mov_time(&self) -> f32 {
+        self.delta_time() * speed::MOVEMENT
+    }
+
+    fn up(&self) -> Vec3 {
+        self.rotation.mul_vec3(rotation::UP)
+    }
+
+    fn forward(&self) -> Vec3 {
+        self.rotation.mul_vec3(rotation::FORWARD)
+    }
+
+    fn right(&self) -> Vec3 {
+        self.rotation.mul_vec3(rotation::RIGHT)
+    }
 }
 
 fn main() {
@@ -318,6 +356,10 @@ fn main() {
         .build_vk_surface(&event_loop, instance.clone())
         .unwrap();
     surface.window().set_cursor_visible(false);
+    surface
+        .window()
+        .set_cursor_grab(CursorGrabMode::Confined)
+        .unwrap();
 
     let device_extensions = DeviceExtensions {
         khr_swapchain: true,
@@ -408,142 +450,119 @@ fn main() {
     let mut fences: Vec<Option<Arc<FenceSignalFuture<_>>>> = vec![None; images.len()];
     let mut previous_fence_index = 0;
 
-    let mut window_center = get_window_center(surface.window());
+    let mut event_helper = EventHelper::new(Data {
+        surface,
+        window_frozen: false,
+        window_resized: false,
+        recreate_swapchain: false,
+        dimensions: Vec2::from_array(viewport.dimensions),
+        cursor_delta: Vec2::ZERO,
+        position: Vec3::ZERO,
+        rotation: Quat::IDENTITY,
+        last_update: Instant::now(),
+        quit: false,
+    });
 
-    let mut input_helper = WinitInputHelper::new();
-    let mut cursor_delta = DVec2::ZERO;
+    let exit = |data: &mut Data<Window>| data.quit = true;
+    event_helper.close_requested(exit);
+    event_helper.keyboard(VirtualKeyCode::Escape, ElementState::Pressed, exit);
 
-    #[cfg(debug_assertions)]
-    let mut fps_helper = fps_counter::FPSCounter::new();
+    event_helper
+        .raw_mouse_delta(|data, (dx, dy)| data.cursor_delta += DVec2::new(dx, dy).as_vec2());
 
-    let mut last_update = Instant::now();
+    event_helper.focused(|data, focused| data.window_frozen = !focused);
 
-    let mut window_resized = false;
-    let mut window_frozen = false;
-    let mut recreate_swapchain = false;
+    event_helper.resized(|data, size| {
+        data.window_frozen = size.width == 0 || size.height == 0;
+        data.window_resized = true;
+        data.dimensions = UVec2::new(size.width, size.height).as_vec2();
+    });
+
+    event_helper.keyboard(VirtualKeyCode::F11, ElementState::Pressed, |data| {
+        let window = data.window();
+        match window.fullscreen() {
+            Some(_) => window.set_fullscreen(None),
+            None => window.set_fullscreen(Some(Fullscreen::Borderless(None))),
+        }
+    });
 
     event_loop.run(move |event, _, control_flow| {
-        if let Event::WindowEvent {
-            event: WindowEvent::Focused(focused),
-            ..
-        } = event
-        {
-            window_frozen = !focused;
-        }
-
-        if let Event::DeviceEvent {
-            event: DeviceEvent::MouseMotion { delta: (dx, dy) },
-            ..
-        } = event
-        {
-            cursor_delta += DVec2::new(dx, dy);
-        }
-
-        if !input_helper.update(&event) {
-            return;
-        }
-
-        if input_helper.quit() || input_helper.key_released(VirtualKeyCode::Escape) {
+        if event_helper.quit {
             *control_flow = ControlFlow::Exit;
         }
 
-        if let Some(size) = input_helper.window_resized() {
-            // window minimized
-            window_frozen = size.width == 0 || size.height == 0;
-            window_resized = true;
-            window_center = get_window_center(surface.window());
-            viewport.dimensions = window_center.mul(2.0).to_array();
-        }
-
-        surface
-            .window()
-            .set_cursor_position(window_center.to_pos())
-            .unwrap();
-
-        if window_frozen {
+        if !event_helper.update(&event) || event_helper.window_frozen {
             return;
         }
 
-        #[cfg(debug_assertions)]
-        println!("{}", fps_helper.tick());
+        event_helper
+            .window()
+            .set_cursor_position((event_helper.dimensions / 2.0).to_pos())
+            .unwrap();
 
-        if input_helper.key_pressed(VirtualKeyCode::F11) {
-            let window = surface.window();
-            match window.fullscreen() {
-                Some(_) => window.set_fullscreen(None),
-                None => window.set_fullscreen(Some(Fullscreen::Borderless(None))),
-            }
-        }
-
-        let delta_time = last_update.elapsed().as_secs_f32();
-        last_update = Instant::now();
-
-        let mut rotation = Quat::from_array(push_constants.rot);
-
-        let mov = cursor_delta.as_vec2() / Vec2::from_array(viewport.dimensions)
-            * speed::ROTATION
-            * speed::MOUSE;
+        let mov =
+            event_helper.cursor_delta / event_helper.dimensions.y * speed::ROTATION * speed::MOUSE;
         // yaw
-        rotation *= Quat::from_axis_angle(-rotation::UP, mov.x);
-        println!("{}", Quat::from_axis_angle(-rotation::UP, mov.x));
+        event_helper.rotation *= Quat::from_axis_angle(-rotation::UP, mov.x);
         // pitch
-        rotation *= Quat::from_axis_angle(rotation::RIGHT, mov.y);
-        println!("{}", Quat::from_axis_angle(-rotation::RIGHT, mov.y));
+        event_helper.rotation *= Quat::from_axis_angle(rotation::RIGHT, mov.y);
 
-        cursor_delta = DVec2::ZERO;
+        event_helper.cursor_delta = Vec2::ZERO;
 
-        let rot_time = delta_time * speed::ROTATION;
+        let rot_time = event_helper.rot_time();
 
-        if input_helper.key_held(VirtualKeyCode::Left) {
-            rotation *= Quat::from_axis_angle(rotation::UP, rot_time);
+        if event_helper.key_held(VirtualKeyCode::Left) {
+            event_helper.rotation *= Quat::from_axis_angle(rotation::UP, rot_time);
         }
-        if input_helper.key_held(VirtualKeyCode::Right) {
-            rotation *= Quat::from_axis_angle(-rotation::UP, rot_time);
+        if event_helper.key_held(VirtualKeyCode::Right) {
+            event_helper.rotation *= Quat::from_axis_angle(-rotation::UP, rot_time);
         }
-        if input_helper.key_held(VirtualKeyCode::Down) {
-            rotation *= Quat::from_axis_angle(rotation::RIGHT, rot_time);
+        if event_helper.key_held(VirtualKeyCode::Up) {
+            event_helper.rotation *= Quat::from_axis_angle(-rotation::RIGHT, rot_time);
         }
-        if input_helper.key_held(VirtualKeyCode::Up) {
-            rotation *= Quat::from_axis_angle(-rotation::RIGHT, rot_time);
-        }
-
-        rotation.y = 0.0;
-        push_constants.rot = rotation.to_array();
-
-        let mov_time = delta_time * speed::MOVEMENT;
-
-        let quaternion = Quat::from_array(push_constants.rot).normalize();
-        let forward = quaternion.mul_vec3(rotation::FORWARD);
-        let right = quaternion.mul_vec3(rotation::RIGHT);
-        let up = quaternion.mul_vec3(rotation::UP);
-
-        let mut position = Vec3::from_array(push_constants.pos);
-
-        if input_helper.key_held(VirtualKeyCode::A) {
-            position -= right * mov_time;
-        }
-        if input_helper.key_held(VirtualKeyCode::D) {
-            position += right * mov_time;
-        }
-        if input_helper.key_held(VirtualKeyCode::W) {
-            position += forward * mov_time;
-        }
-        if input_helper.key_held(VirtualKeyCode::S) {
-            position -= forward * mov_time;
-        }
-        if input_helper.key_held(VirtualKeyCode::Q) {
-            position += up * mov_time;
-        }
-        if input_helper.key_held(VirtualKeyCode::E) {
-            position -= up * mov_time;
+        if event_helper.key_held(VirtualKeyCode::Down) {
+            event_helper.rotation *= Quat::from_axis_angle(rotation::RIGHT, rot_time);
         }
 
-        push_constants.pos = position.to_array();
+        if event_helper.key_held(VirtualKeyCode::A) {
+            let change = event_helper.right() * event_helper.mov_time();
+            event_helper.position -= change;
+        }
+        if event_helper.key_held(VirtualKeyCode::D) {
+            let change = event_helper.right() * event_helper.mov_time();
+            event_helper.position += change;
+        }
+        if event_helper.key_held(VirtualKeyCode::W) {
+            let change = event_helper.forward() * event_helper.mov_time();
+            event_helper.position += change;
+        }
+        if event_helper.key_held(VirtualKeyCode::S) {
+            let change = event_helper.forward() * event_helper.mov_time();
+            event_helper.position -= change;
+        }
+        if event_helper.key_held(VirtualKeyCode::Q) {
+            let change = event_helper.up() * event_helper.mov_time();
+            event_helper.position += change;
+        }
+        if event_helper.key_held(VirtualKeyCode::E) {
+            let change = event_helper.up() * event_helper.mov_time();
+            event_helper.position -= change;
+        }
 
-        if recreate_swapchain || window_resized {
-            recreate_swapchain = false;
+        // neutralizes roll
+        event_helper.rotation.y = 0.0;
+        event_helper.rotation = event_helper.rotation.normalize();
 
-            let dimensions = surface.window().inner_size();
+        push_constants.rot = event_helper.rotation.to_array();
+        push_constants.pos = event_helper.position.to_array();
+
+        event_helper.last_update = Instant::now();
+
+        // vvv rendering vvv
+        if event_helper.recreate_swapchain || event_helper.window_resized {
+            event_helper.recreate_swapchain = false;
+
+            let dimensions = event_helper.window().inner_size();
 
             let (new_swapchain, images) = match swapchain.recreate(SwapchainCreateInfo {
                 image_extent: dimensions.into(),
@@ -557,10 +576,10 @@ fn main() {
 
             framebuffers = get_framebuffers(&images, render_pass.clone());
 
-            if window_resized {
-                window_resized = false;
+            if event_helper.window_resized {
+                event_helper.window_resized = false;
 
-                viewport.dimensions = dimensions.into();
+                viewport.dimensions = event_helper.dimensions.to_array();
 
                 graphics_pipeline = get_graphics_pipeline(
                     device.clone(),
@@ -579,11 +598,11 @@ fn main() {
             match swapchain::acquire_next_image(swapchain.clone(), None) {
                 Ok(ok) => ok,
                 Err(AcquireError::OutOfDate) => {
-                    return recreate_swapchain = true;
+                    return event_helper.recreate_swapchain = true;
                 }
                 Err(err) => panic!("{}", err),
             };
-        recreate_swapchain |= suboptimal;
+        event_helper.recreate_swapchain |= suboptimal;
 
         if let Some(image_fence) = &fences[image_index] {
             image_fence.wait(None).unwrap();
@@ -617,7 +636,7 @@ fn main() {
         fences[image_index] = match future {
             Ok(ok) => Some(Arc::new(ok)),
             Err(FlushError::OutOfDate) => {
-                recreate_swapchain = true;
+                event_helper.recreate_swapchain = true;
                 None
             }
             Err(err) => {

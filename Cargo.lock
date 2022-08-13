@@ -1192,7 +1192,6 @@ dependencies = [
  "vulkano-win",
  "winit",
  "winit_event_helper",
- "winit_input_helper",
 ]
 
 [[package]]
@@ -1834,15 +1833,6 @@ name = "winit_event_helper"
 version = "0.1.0"
 dependencies = [
  "ahash",
- "winit",
-]
-
-[[package]]
-name = "winit_input_helper"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de23d6018b4ff6e9a6bd069109b3c891a44acc97a212e744598c6971a9ee0384"
-dependencies = [
  "winit",
 ]
 
