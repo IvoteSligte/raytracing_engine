@@ -1,6 +1,5 @@
-use std::{sync::Arc, time::Instant};
+use std::{f32::consts::PI, sync::Arc, time::Instant};
 
-use extend::ext;
 use glam::{DVec2, Quat, UVec2, Vec2, Vec3};
 use vulkano::{
     buffer::{BufferUsage, DeviceLocalBuffer},
@@ -22,7 +21,7 @@ use vulkano::{
             vertex_input::VertexInputState,
             viewport::{Viewport, ViewportState},
         },
-        GraphicsPipeline, Pipeline, PipelineBindPoint,
+        ComputePipeline, GraphicsPipeline, Pipeline, PipelineBindPoint,
     },
     render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
     shader::ShaderModule,
@@ -86,9 +85,13 @@ void main() {
     vec2 normCoord = gl_FragCoord.xy / view.size - 0.5;
     normCoord.x *= view.size.x / view.size.y;
 
+    // light
     vec4 light = vec4(5.0, 5.0, 0.0, 100.0); // w = strength
-    vec4 sphere = vec4(0.0, 5.0, 0.0, 2.0); // w = radius
 
+    // object
+    vec4 sphere = vec4(0.0, 4.0, 0.0, 2.0); // w = radius
+    float rep = 15.0;
+    float halfRep = rep / 2.0;
     vec3 colorMat = vec3(0.2, 0.2, 1.0);
     float specularMat = 1.0;
     float diffuseMat = 1.0;
@@ -97,47 +100,62 @@ void main() {
     float ambientScene = 0.8;
 
     float nearClipPlane = 1.0;
-    uint farClipPlane = 1000;
-    float stepLength = 0.01;
+    uint maxSteps = 500;
+    float minStep = 0.1;
 
     vec3 fragPos = vec3(normCoord.x, 1.0, normCoord.y);
     fragPos = rotate(pc.rot, fragPos);
     vec3 position = pc.pos + fragPos * nearClipPlane;
-    vec3 step = normalize(fragPos) * stepLength;
+    vec3 step = normalize(fragPos) * minStep;
 
-    while (length(position) < farClipPlane) {
-        float minDist = distance(position, sphere.xyz);
-        if (minDist <= sphere.w) {
-            vec3 lightDir = normalize(light.xyz - position);
-            
-            float lightDist = distance(position, light.xyz);
+    for (uint i = 0; i < maxSteps; i++) {
+        vec3 repeated = mod(position + halfRep, rep) - halfRep;
+
+        float dist = distance(repeated, sphere.xyz) - sphere.w;
+        if (abs(dist) <= minStep) {
+            // light
+            vec3 lightDir = normalize(light.xyz - repeated);
+
+            float lightDist = distance(repeated, light.xyz);
             float lightDistFallOff = 1.0 / (lightDist * lightDist);
             
-            float camDist = distance(position, fragPos);
+            // camera
+            float camDist = distance(repeated, fragPos);
             float camDistFallOff = 1.0 / (camDist * camDist);
 
-            vec3 normal = normalize(position - sphere.xyz);
+            // object
+            vec3 normal = normalize(repeated - sphere.xyz);
             vec3 reflection = reflect(lightDir, normal);
 
-            vec3 ambient = ambientScene * colorMat;
-            vec3 diffuse = max(dot(normal, lightDir), 0.0) * light.w * diffuseMat * colorMat * lightDistFallOff;
-            vec3 specular = max(pow(dot(reflection, fragPos), shineMat), 0.0) * specularMat * colorMat * lightDistFallOff;
+            float diffuse = max(dot(normal, lightDir), 0.0) * light.w * diffuseMat;
+            float specular = max(pow(dot(reflection, fragPos), shineMat), 0.0) * specularMat;
 
-            fragColor = vec4((ambient + diffuse + specular) * camDistFallOff, 1.0);
+            float direct = (diffuse + specular) * lightDistFallOff;
+
+            fragColor = vec4((ambientScene + direct) * colorMat * camDistFallOff, 1.0);
             return;
         }
-        position += step * minDist; // incl treshold: max(step * minDist, minStep)
+        position += step * max(dist, minStep);
     }
     fragColor = vec4(0.0, 0.0, 0.0, 1.0);
 }"
     }
 }
 
-#[ext]
-impl Vec2 {
-    fn to_pos(self) -> PhysicalPosition<f32> {
-        PhysicalPosition::new(self.x, self.y)
+mod compute_shader {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        src: "
+#version 460
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+void main() {}"
     }
+}
+
+fn to_position(vec: Vec2) -> PhysicalPosition<f32> {
+    PhysicalPosition::new(vec.x, vec.y)
 }
 
 fn select_physical_device<'a, W>(
@@ -166,7 +184,7 @@ fn get_render_pass(device: Arc<Device>, swapchain: Arc<Swapchain<Window>>) -> Ar
     vulkano::single_pass_renderpass!(device.clone(),
         attachments: {
             color: {
-                load: Clear,
+                load: DontCare,
                 store: Store,
                 format: swapchain.image_format(),
                 samples: 1,
@@ -218,6 +236,20 @@ fn get_graphics_pipeline(
         .unwrap()
 }
 
+fn get_compute_pipeline(
+    device: Arc<Device>,
+    compute_shader: Arc<ShaderModule>,
+) -> Arc<ComputePipeline> {
+    ComputePipeline::new(
+        device.clone(),
+        compute_shader.entry_point("main").unwrap(),
+        &(),
+        None,
+        |_| {},
+    )
+    .unwrap()
+}
+
 fn get_descriptor_set(
     graphics_pipeline: Arc<GraphicsPipeline>,
     queue: Arc<Queue>,
@@ -257,7 +289,7 @@ where
     builder
         .begin_render_pass(
             RenderPassBeginInfo {
-                clear_values: vec![Some([0.0, 0.0, 0.0, 1.0].into())],
+                clear_values: vec![None],
                 ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
             },
             SubpassContents::Inline,
@@ -281,7 +313,7 @@ where
 
 #[allow(dead_code)]
 mod speed {
-    pub const MOVEMENT: f32 = 4.0;
+    pub const MOVEMENT: f32 = 30.0;
     pub const ROTATION: f32 = 1.0;
     pub const MOUSE: f32 = 1.0;
 }
@@ -303,7 +335,7 @@ struct Data<W> {
     dimensions: Vec2,
     cursor_delta: Vec2,
     position: Vec3,
-    rotation: Quat,
+    rotation: Vec2,
     last_update: Instant,
     quit: bool,
 }
@@ -325,16 +357,20 @@ impl<W> Data<W> {
         self.delta_time() * speed::MOVEMENT
     }
 
+    fn rotation(&self) -> Quat {
+        Quat::from_rotation_z(-self.rotation.x) * Quat::from_rotation_x(self.rotation.y)
+    }
+
     fn up(&self) -> Vec3 {
-        self.rotation.mul_vec3(rotation::UP)
+        self.rotation().mul_vec3(rotation::UP)
     }
 
     fn forward(&self) -> Vec3 {
-        self.rotation.mul_vec3(rotation::FORWARD)
+        self.rotation().mul_vec3(rotation::FORWARD)
     }
 
     fn right(&self) -> Vec3 {
-        self.rotation.mul_vec3(rotation::RIGHT)
+        self.rotation().mul_vec3(rotation::RIGHT)
     }
 }
 
@@ -438,7 +474,7 @@ fn main() {
     );
 
     let mut push_constants = fragment_shader::ty::PushConstantData {
-        rot: [0.0, 0.0, 0.0, 1.0],
+        rot: [0.0, 0.0, 0.0, 0.0],
         pos: [0.0, 0.0, 0.0],
     };
 
@@ -458,7 +494,7 @@ fn main() {
         dimensions: Vec2::from_array(viewport.dimensions),
         cursor_delta: Vec2::ZERO,
         position: Vec3::ZERO,
-        rotation: Quat::IDENTITY,
+        rotation: Vec2::ZERO,
         last_update: Instant::now(),
         quit: false,
     });
@@ -487,41 +523,38 @@ fn main() {
     });
 
     event_loop.run(move |event, _, control_flow| {
-        if event_helper.quit {
-            *control_flow = ControlFlow::Exit;
-        }
-
         if !event_helper.update(&event) || event_helper.window_frozen {
             return;
         }
 
+        if event_helper.quit {
+            *control_flow = ControlFlow::Exit;
+        }
+
         event_helper
             .window()
-            .set_cursor_position((event_helper.dimensions / 2.0).to_pos())
+            .set_cursor_position(to_position(event_helper.dimensions / 2.0))
             .unwrap();
 
-        let mov =
+        let cursor_mov =
             event_helper.cursor_delta / event_helper.dimensions.y * speed::ROTATION * speed::MOUSE;
-        // yaw
-        event_helper.rotation *= Quat::from_axis_angle(-rotation::UP, mov.x);
-        // pitch
-        event_helper.rotation *= Quat::from_axis_angle(rotation::RIGHT, mov.y);
+        event_helper.rotation += cursor_mov;
 
         event_helper.cursor_delta = Vec2::ZERO;
 
         let rot_time = event_helper.rot_time();
 
         if event_helper.key_held(VirtualKeyCode::Left) {
-            event_helper.rotation *= Quat::from_axis_angle(rotation::UP, rot_time);
+            event_helper.rotation.x += rot_time;
         }
         if event_helper.key_held(VirtualKeyCode::Right) {
-            event_helper.rotation *= Quat::from_axis_angle(-rotation::UP, rot_time);
+            event_helper.rotation.x -= rot_time;
         }
         if event_helper.key_held(VirtualKeyCode::Up) {
-            event_helper.rotation *= Quat::from_axis_angle(-rotation::RIGHT, rot_time);
+            event_helper.rotation.y -= rot_time;
         }
         if event_helper.key_held(VirtualKeyCode::Down) {
-            event_helper.rotation *= Quat::from_axis_angle(rotation::RIGHT, rot_time);
+            event_helper.rotation.y += rot_time;
         }
 
         if event_helper.key_held(VirtualKeyCode::A) {
@@ -549,11 +582,8 @@ fn main() {
             event_helper.position -= change;
         }
 
-        // neutralizes roll
-        event_helper.rotation.y = 0.0;
-        event_helper.rotation = event_helper.rotation.normalize();
-
-        push_constants.rot = event_helper.rotation.to_array();
+        event_helper.rotation.y = event_helper.rotation.y.clamp(-0.5 * PI, 0.5 * PI);
+        push_constants.rot = event_helper.rotation().to_array();
         push_constants.pos = event_helper.position.to_array();
 
         event_helper.last_update = Instant::now();
