@@ -5,7 +5,7 @@ use vulkano::{
     buffer::{BufferUsage, DeviceLocalBuffer},
     command_buffer::{
         AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer,
-        RenderPassBeginInfo, SubpassContents,
+        RenderPassBeginInfo, SubpassContents, ClearColorImageInfo,
     },
     descriptor_set::{DescriptorSetsCollection, PersistentDescriptorSet, WriteDescriptorSet},
     device::{
@@ -13,7 +13,10 @@ use vulkano::{
         Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo,
     },
     format::Format,
-    image::{view::ImageView, ImageUsage, SwapchainImage},
+    image::{
+        view::ImageView, ImageAccess, ImageDimensions, ImageUsage, ImageViewAbstract, StorageImage,
+        SwapchainImage,
+    },
     instance::{Instance, InstanceCreateInfo},
     pipeline::{
         graphics::{
@@ -70,72 +73,87 @@ layout(push_constant) uniform PushConstantData {
     vec3 pos;
 } pc;
 
-layout(binding = 0) uniform ViewportBuffer {
+layout(binding = 0) uniform readonly ViewportBuffer {
     vec2 size;
 } view;
 
+layout(binding = 1, r32f) uniform readonly image2D img;
+
 layout(location = 0) out vec4 fragColor;
 
+// object
+const vec4 sphere = vec4(0.0, 4.0, 0.0, 2.0); // w = radius
+const vec3 colorMat = vec3(0.2, 0.2, 1.0);
+const float specularMat = 1.0;
+const float diffuseMat = 1.0;
+const float shineMat = 4.0;
+
+// scene
+const float ambientScene = 0.2;
+
+// camera
+const float camFallOffFactor = 0.001;
+const uint maxSteps = 100;
+const float minStep = 0.01;
+
+// light
+vec4 light = vec4(5.0, 5.0, 0.0, 10.0); // w = strength
+
 vec3 rotate(vec4 q, vec3 v) {
-    vec3 temp = cross(q.xyz, v) + q.w * v;
-    return v + 2.0 * cross(q.xyz, temp);
+    vec3 t = cross(q.xyz, v) + q.w * v;
+    return v + 2.0 * cross(q.xyz, t);
+}
+
+// modified iq infinite repetition
+// p = point, r = repetition radius, c = repetition center
+vec3 repeat(vec3 p, vec3 r) {
+    return mod(p + 0.5*r, r) - 0.5*r;
 }
 
 void main() {
-    vec2 normCoord = gl_FragCoord.xy / view.size - 0.5;
-    normCoord.x *= view.size.x / view.size.y;
-
-    // light
-    vec4 light = vec4(5.0, 5.0, 0.0, 100.0); // w = strength
-
-    // object
-    vec4 sphere = vec4(0.0, 4.0, 0.0, 2.0); // w = radius
-    float rep = 15.0;
-    float halfRep = rep / 2.0;
-    vec3 colorMat = vec3(0.2, 0.2, 1.0);
-    float specularMat = 1.0;
-    float diffuseMat = 1.0;
-    float shineMat = 1.0;
-
-    float ambientScene = 0.8;
-
-    float nearClipPlane = 1.0;
-    uint maxSteps = 500;
-    float minStep = 0.1;
+    // maps FragCoord to xy range [-1.0, 1.0]
+    vec2 normCoord = gl_FragCoord.xy * 2 / view.size - 1.0;
+    // assuming height <= width, width = 1.0 and height <= 1.0
+    normCoord.y *= view.size.y / view.size.x;
 
     vec3 fragPos = vec3(normCoord.x, 1.0, normCoord.y);
     fragPos = rotate(pc.rot, fragPos);
-    vec3 position = pc.pos + fragPos * nearClipPlane;
-    vec3 step = normalize(fragPos) * minStep;
+    vec3 step = normalize(fragPos);
+    fragPos += pc.pos;
+
+    float totalDist = imageLoad(img, ivec2(gl_FragCoord.xy)).x;
 
     for (uint i = 0; i < maxSteps; i++) {
-        vec3 repeated = mod(position + halfRep, rep) - halfRep;
+        vec3 position = fragPos + step * totalDist;
 
-        float dist = distance(repeated, sphere.xyz) - sphere.w;
-        if (abs(dist) <= minStep) {
+        vec3 repPosition = repeat(position, vec3(10.0));
+        vec3 repFragPos = repeat(fragPos, vec3(10.0));
+
+        float dist = length(repPosition) - sphere.w;
+        if (dist <= 0.0) {
             // light
-            vec3 lightDir = normalize(light.xyz - repeated);
+            vec3 lightDir = normalize(light.xyz - repPosition);
 
-            float lightDist = distance(repeated, light.xyz);
-            float lightDistFallOff = 1.0 / (lightDist * lightDist);
+            float lightDist = distance(repPosition, light.xyz);
+            float lightDistFallOff = lightDist * lightDist;
             
             // camera
-            float camDist = distance(repeated, fragPos);
-            float camDistFallOff = 1.0 / (camDist * camDist);
+            float camDist = distance(position, fragPos);
+            float camDistFallOff = max(camFallOffFactor * (camDist * camDist + 1.0), 1.0);
 
             // object
-            vec3 normal = normalize(repeated - sphere.xyz);
+            vec3 normal = normalize(repPosition);
             vec3 reflection = reflect(lightDir, normal);
 
             float diffuse = max(dot(normal, lightDir), 0.0) * light.w * diffuseMat;
-            float specular = max(pow(dot(reflection, fragPos), shineMat), 0.0) * specularMat;
+            float specular = pow(max(dot(reflection, normalize(repFragPos)), 0.0), shineMat) * specularMat;
 
-            float direct = (diffuse + specular) * lightDistFallOff;
+            float direct = (diffuse + specular) / lightDistFallOff;
 
-            fragColor = vec4((ambientScene + direct) * colorMat * camDistFallOff, 1.0);
+            fragColor = vec4((ambientScene + direct) * colorMat / camDistFallOff, 1.0);
             return;
         }
-        position += step * max(dist, minStep);
+        totalDist += dist + minStep;
     }
     fragColor = vec4(0.0, 0.0, 0.0, 1.0);
 }"
@@ -148,9 +166,67 @@ mod compute_shader {
         src: "
 #version 460
 
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-void main() {}"
+const uint IMAGE_COUNT = 9;
+
+layout(binding = 0, r32f) uniform image2D imgs[IMAGE_COUNT];
+
+layout(push_constant) uniform PushConstantData {
+    vec4 rot;
+    vec3 pos;
+    uint iter;
+} pc;
+
+// sphere
+const vec4 sphere = vec4(0.0, 4.0, 0.0, 2.0); // w = radius
+
+// camera
+const uint maxSteps = 10000;
+
+vec3 rotate(vec4 q, vec3 v) {
+    vec3 t = cross(q.xyz, v) + q.w * v;
+    return v + 2.0 * cross(q.xyz, t);
+}
+
+// p = point, r = repetition radius, c = repetition center
+vec3 repeat(vec3 p, vec3 r) {
+    return mod(p + 0.5*r, r) - 0.5*r;
+}
+
+// TODO: fix low resolution/layer flickering
+void main() {
+    // TODO: make hardcoded resolution softcoded
+    vec2 normCoord = ((gl_GlobalInvocationID.xy * 2 + 1) << (IMAGE_COUNT - pc.iter - 1)) / vec2(1920, 1080) - 1.0;
+    normCoord.y *= 1080.0 / 1920.0;
+
+    float thresholdDist = 1.414213 / (gl_NumWorkGroups.x * gl_WorkGroupSize.x); // sqrt(2) / width
+
+    vec3 fragPos = vec3(normCoord.x, 1.0, normCoord.y);
+    fragPos = rotate(pc.rot, fragPos);
+    vec3 step = normalize(fragPos);
+    fragPos += pc.pos;
+
+    float totalDist = 0.0;
+    if (pc.iter > 0) {
+        totalDist = imageLoad(imgs[pc.iter - 1], ivec2(gl_GlobalInvocationID.xy / 2)).r;
+    }
+
+    for (uint i = 0; i < maxSteps; i++) {
+        vec3 position = fragPos + step * totalDist;
+
+        vec3 repPosition = repeat(position, vec3(10.0));
+        vec3 repFragPos = repeat(fragPos, vec3(10.0));
+
+        float dist = length(repPosition) - sphere.w;
+        float radius = (totalDist + dist + 1.0) * thresholdDist;
+        if (dist < radius) {
+            break;
+        }
+        totalDist += dist;
+    }
+    imageStore(imgs[pc.iter], ivec2(gl_GlobalInvocationID.xy), vec4(max(totalDist, 0.0)));
+}"
     }
 }
 
@@ -167,7 +243,11 @@ fn select_physical_device<'a, W>(
         .filter(|&p| p.supported_extensions().is_superset_of(device_extensions))
         .filter_map(|p| {
             p.queue_families()
-                .find(|q| q.supports_graphics() && q.supports_surface(surface).unwrap_or(false))
+                .find(|q| {
+                    q.supports_graphics()
+                        && q.supports_surface(surface).unwrap_or(false)
+                        && q.supports_compute()
+                })
                 .map(|q| (p, q))
         })
         .min_by_key(|(p, _)| match p.properties().device_type {
@@ -250,10 +330,11 @@ fn get_compute_pipeline(
     .unwrap()
 }
 
-fn get_descriptor_set(
-    graphics_pipeline: Arc<GraphicsPipeline>,
+fn get_graphics_descriptor_set(
+    pipeline: Arc<GraphicsPipeline>,
     queue: Arc<Queue>,
     viewport: Viewport,
+    image_view: Arc<dyn ImageViewAbstract>,
 ) -> Arc<PersistentDescriptorSet> {
     let (uniform_buffer, _) = DeviceLocalBuffer::from_data(
         viewport.dimensions,
@@ -261,20 +342,42 @@ fn get_descriptor_set(
         queue.clone(),
     )
     .unwrap();
+
     PersistentDescriptorSet::new(
-        graphics_pipeline.layout().set_layouts()[0].clone(),
-        [WriteDescriptorSet::buffer(0, uniform_buffer.clone())],
+        pipeline.layout().set_layouts()[0].clone(),
+        [
+            WriteDescriptorSet::buffer(0, uniform_buffer.clone()),
+            WriteDescriptorSet::image_view(1, image_view.clone()),
+        ],
     )
     .unwrap()
 }
 
-fn get_primary_command_buffer<S>(
+fn get_compute_descriptor_set(
+    pipeline: Arc<ComputePipeline>,
+    image_views: Vec<Arc<dyn ImageViewAbstract>>,
+) -> Arc<PersistentDescriptorSet> {
+    PersistentDescriptorSet::new(
+        pipeline.layout().set_layouts()[0].clone(),
+        [WriteDescriptorSet::image_view_array(
+            0,
+            0,
+            image_views.clone(),
+        )],
+    )
+    .unwrap()
+}
+
+fn get_command_buffer<S>(
     device: Arc<Device>,
     queue: Arc<Queue>,
     graphics_pipeline: Arc<GraphicsPipeline>,
+    compute_pipeline: Arc<ComputePipeline>,
     framebuffer: Arc<Framebuffer>,
+    compute_images: &Vec<Arc<StorageImage>>,
     push_constants: fragment_shader::ty::PushConstantData,
-    descriptor_set: S,
+    graphics_descriptor_set: S,
+    compute_descriptor_set: S,
 ) -> Arc<PrimaryAutoCommandBuffer>
 where
     S: DescriptorSetsCollection + Clone,
@@ -285,6 +388,31 @@ where
         CommandBufferUsage::OneTimeSubmit,
     )
     .unwrap();
+
+    builder
+        .bind_pipeline_compute(compute_pipeline.clone())
+        .bind_descriptor_sets(
+            PipelineBindPoint::Compute,
+            compute_pipeline.layout().clone(),
+            0,
+            compute_descriptor_set.clone(),
+        );
+
+    for (image, iter) in compute_images.iter().zip(0..) {
+        let compute_pc = compute_shader::ty::PushConstantData {
+            iter,
+            rot: push_constants.rot,
+            pos: push_constants.pos,
+        };
+        let [w, h] = image.dimensions().width_height(); // assumes depth = 1
+
+        builder
+            .push_constants(compute_pipeline.layout().clone(), 0, compute_pc)
+            .clear_color_image(ClearColorImageInfo::image(image.clone()))
+            .unwrap()
+            .dispatch([w / 8, h / 8, 1])
+            .unwrap();
+    }
 
     builder
         .begin_render_pass(
@@ -301,7 +429,7 @@ where
             PipelineBindPoint::Graphics,
             graphics_pipeline.layout().clone(),
             0,
-            descriptor_set.clone(),
+            graphics_descriptor_set.clone(),
         )
         .draw(3, 1, 0, 0)
         .unwrap()
@@ -326,6 +454,8 @@ mod rotation {
     pub const FORWARD: Vec3 = Vec3::new(0.0, 1.0, 0.0);
     pub const RIGHT: Vec3 = Vec3::new(1.0, 0.0, 0.0);
 }
+
+const COMPUTE_IMAGE_COUNT: u32 = 9;
 
 struct Data<W> {
     surface: Arc<Surface<W>>,
@@ -473,13 +603,50 @@ fn main() {
         render_pass.clone(),
     );
 
+    let compute_shader = compute_shader::load(device.clone()).unwrap();
+
+    let compute_pipeline = get_compute_pipeline(device.clone(), compute_shader.clone());
+
     let mut push_constants = fragment_shader::ty::PushConstantData {
         rot: [0.0, 0.0, 0.0, 0.0],
         pos: [0.0, 0.0, 0.0],
     };
 
-    let mut descriptor_set =
-        get_descriptor_set(graphics_pipeline.clone(), queue.clone(), viewport.clone());
+    // TODO: specify usage
+    // TODO: reconstruct on resize
+    let compute_images = (0..COMPUTE_IMAGE_COUNT)
+        .map(|i| {
+            let ratio = Vec2::new(1920.0, 1080.0) / (4 << COMPUTE_IMAGE_COUNT) as f32;
+            let dims = ((1 << i) as f32 * ratio).ceil().as_uvec2() * 8;
+
+            StorageImage::new(
+                device.clone(),
+                ImageDimensions::Dim2d {
+                    width: dims.x,
+                    height: dims.y,
+                    array_layers: 1,
+                },
+                Format::R32_SFLOAT,
+                Some(queue.family()),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let compute_image_views = compute_images
+        .iter()
+        .map(|image| ImageView::new_default(image.clone()).unwrap() as _)
+        .collect::<Vec<Arc<dyn ImageViewAbstract>>>();
+
+    let mut graphics_descriptor_set = get_graphics_descriptor_set(
+        graphics_pipeline.clone(),
+        queue.clone(),
+        viewport.clone(),
+        compute_image_views.last().unwrap().clone(),
+    );
+
+    let compute_descriptor_set =
+        get_compute_descriptor_set(compute_pipeline.clone(), compute_image_views.clone());
 
     let mut command_buffers = vec![None; framebuffers.len()];
 
@@ -531,6 +698,8 @@ fn main() {
             *control_flow = ControlFlow::Exit;
         }
 
+        // BUG: thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value: Os(OsError { line: 345, file: "C:\\Users\\gebruiker\\.cargo\\registry\\src\\github.com-1ecc6299db9ec823\\winit-0.27.2\\src\\platform_impl\\windows\\window.rs", error: Os { code: 0, kind: Uncategorized, message: "The operation completed successfully." } })'
+        // possible cause: window was not focused on startup, which has a chance of happening when a key is pressed during startup
         event_helper
             .window()
             .set_cursor_position(to_position(event_helper.dimensions / 2.0))
@@ -619,8 +788,12 @@ fn main() {
                     render_pass.clone(),
                 );
 
-                descriptor_set =
-                    get_descriptor_set(graphics_pipeline.clone(), queue.clone(), viewport.clone());
+                graphics_descriptor_set = get_graphics_descriptor_set(
+                    graphics_pipeline.clone(),
+                    queue.clone(),
+                    viewport.clone(),
+                    compute_image_views.last().unwrap().clone(),
+                );
             }
         }
 
@@ -638,13 +811,16 @@ fn main() {
             image_fence.wait(None).unwrap();
         }
 
-        command_buffers[image_index] = Some(get_primary_command_buffer(
+        command_buffers[image_index] = Some(get_command_buffer(
             device.clone(),
             queue.clone(),
             graphics_pipeline.clone(),
+            compute_pipeline.clone(),
             framebuffers[image_index].clone(),
+            &compute_images, // TODO: add compute_image for each framebuffer
             push_constants.clone(),
-            descriptor_set.clone(),
+            graphics_descriptor_set.clone(),
+            compute_descriptor_set.clone(),
         ));
 
         let previous_future = match fences[previous_fence_index].clone() {

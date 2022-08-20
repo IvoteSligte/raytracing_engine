@@ -1146,7 +1146,6 @@ dependencies = [
 name = "raytracing_engine"
 version = "0.1.0"
 dependencies = [
- "bytemuck",
  "fps_counter",
  "glam",
  "image",

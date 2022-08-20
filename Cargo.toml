@@ -11,8 +11,7 @@ path = "C:/Users/gebruiker/IdeaProjects/winit_event_helper"
 [dependencies]
 vulkano = { version = "0.30.0", git = "https://github.com/vulkano-rs/vulkano" }
 vulkano-shaders = "0.30.0"
-vulkano-win = { git = "https://github.com/vulkano-rs/vulkano" }
-bytemuck = "1.10.0"
+vulkano-win = { version = "0.30.0", git = "https://github.com/vulkano-rs/vulkano" }
 image = "0.24.3"
 winit = "0.27.2"
 glam = "0.21.3"
