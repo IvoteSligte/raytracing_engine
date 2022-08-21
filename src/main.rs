@@ -2,10 +2,9 @@ use std::{f32::consts::PI, sync::Arc, time::Instant};
 
 use glam::{DVec2, Quat, UVec2, Vec2, Vec3};
 use vulkano::{
-    buffer::{BufferUsage, DeviceLocalBuffer},
     command_buffer::{
-        AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer,
-        RenderPassBeginInfo, SubpassContents, ClearColorImageInfo,
+        AutoCommandBufferBuilder, ClearColorImageInfo, CommandBufferUsage,
+        PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassContents,
     },
     descriptor_set::{DescriptorSetsCollection, PersistentDescriptorSet, WriteDescriptorSet},
     device::{
@@ -14,8 +13,8 @@ use vulkano::{
     },
     format::Format,
     image::{
-        view::ImageView, ImageAccess, ImageDimensions, ImageUsage, ImageViewAbstract, StorageImage,
-        SwapchainImage,
+        view::ImageView, ImageAccess, ImageCreateFlags, ImageDimensions, ImageUsage,
+        ImageViewAbstract, StorageImage, SwapchainImage,
     },
     instance::{Instance, InstanceCreateInfo},
     pipeline::{
@@ -36,7 +35,6 @@ use vulkano::{
 };
 use vulkano_win::VkSurfaceBuild;
 use winit::{
-    dpi::PhysicalPosition,
     event::{ElementState, VirtualKeyCode},
     event_loop::{ControlFlow, EventLoop},
     window::{CursorGrabMode, Fullscreen, Window, WindowBuilder},
@@ -71,13 +69,10 @@ mod fragment_shader {
 layout(push_constant) uniform PushConstantData {
     vec4 rot;
     vec3 pos;
+    vec2 view;
 } pc;
 
-layout(binding = 0) uniform readonly ViewportBuffer {
-    vec2 size;
-} view;
-
-layout(binding = 1, r32f) uniform readonly image2D img;
+layout(binding = 0, r32f) uniform readonly image2D img;
 
 layout(location = 0) out vec4 fragColor;
 
@@ -86,7 +81,7 @@ const vec4 sphere = vec4(0.0, 4.0, 0.0, 2.0); // w = radius
 const vec3 colorMat = vec3(0.2, 0.2, 1.0);
 const float specularMat = 1.0;
 const float diffuseMat = 1.0;
-const float shineMat = 4.0;
+const float shineMat = 1.0;
 
 // scene
 const float ambientScene = 0.2;
@@ -106,15 +101,15 @@ vec3 rotate(vec4 q, vec3 v) {
 
 // modified iq infinite repetition
 // p = point, r = repetition radius, c = repetition center
-vec3 repeat(vec3 p, vec3 r) {
-    return mod(p + 0.5*r, r) - 0.5*r;
+vec3 repeat(vec3 p, vec3 r, vec3 c) {
+    return mod(p - c + 0.5*r, r) - 0.5*r;
 }
 
 void main() {
     // maps FragCoord to xy range [-1.0, 1.0]
-    vec2 normCoord = gl_FragCoord.xy * 2 / view.size - 1.0;
+    vec2 normCoord = gl_FragCoord.xy * 2 / pc.view - 1.0;
     // assuming height <= width, width = 1.0 and height <= 1.0
-    normCoord.y *= view.size.y / view.size.x;
+    normCoord.y *= pc.view.y / pc.view.x;
 
     vec3 fragPos = vec3(normCoord.x, 1.0, normCoord.y);
     fragPos = rotate(pc.rot, fragPos);
@@ -123,11 +118,12 @@ void main() {
 
     float totalDist = imageLoad(img, ivec2(gl_FragCoord.xy)).x;
 
+    // fragColor = vec4(totalDist / 100000.0, 0.0, 0.0, 1.0);
+    // return;
+
     for (uint i = 0; i < maxSteps; i++) {
         vec3 position = fragPos + step * totalDist;
-
-        vec3 repPosition = repeat(position, vec3(10.0));
-        vec3 repFragPos = repeat(fragPos, vec3(10.0));
+        vec3 repPosition = repeat(position, vec3(10.0), sphere.xyz);
 
         float dist = length(repPosition) - sphere.w;
         if (dist <= 0.0) {
@@ -146,7 +142,8 @@ void main() {
             vec3 reflection = reflect(lightDir, normal);
 
             float diffuse = max(dot(normal, lightDir), 0.0) * light.w * diffuseMat;
-            float specular = pow(max(dot(reflection, normalize(repFragPos)), 0.0), shineMat) * specularMat;
+            // fix specular
+            float specular = pow(max(dot(reflection, -step), 0.0), shineMat) * specularMat;
 
             float direct = (diffuse + specular) / lightDistFallOff;
 
@@ -168,21 +165,22 @@ mod compute_shader {
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-const uint IMAGE_COUNT = 9;
-
-layout(binding = 0, r32f) uniform image2D imgs[IMAGE_COUNT];
-
 layout(push_constant) uniform PushConstantData {
     vec4 rot;
     vec3 pos;
     uint iter;
+    vec2 view;
+    uint img_c; // image count
 } pc;
+
+// 9 images allows for a maximum resolution of 2048x2048 pixels
+layout(binding = 0, r32f) uniform image2D imgs[9];
 
 // sphere
 const vec4 sphere = vec4(0.0, 4.0, 0.0, 2.0); // w = radius
 
 // camera
-const uint maxSteps = 10000;
+const uint maxSteps = 1000;
 
 vec3 rotate(vec4 q, vec3 v) {
     vec3 t = cross(q.xyz, v) + q.w * v;
@@ -190,17 +188,15 @@ vec3 rotate(vec4 q, vec3 v) {
 }
 
 // p = point, r = repetition radius, c = repetition center
-vec3 repeat(vec3 p, vec3 r) {
-    return mod(p + 0.5*r, r) - 0.5*r;
+vec3 repeat(vec3 p, vec3 r, vec3 c) {
+    return mod(p - c + 0.5*r, r) - 0.5*r;
 }
 
-// TODO: fix low resolution/layer flickering
 void main() {
-    // TODO: make hardcoded resolution softcoded
-    vec2 normCoord = ((gl_GlobalInvocationID.xy * 2 + 1) << (IMAGE_COUNT - pc.iter - 1)) / vec2(1920, 1080) - 1.0;
-    normCoord.y *= 1080.0 / 1920.0;
+    vec2 normCoord = ((gl_GlobalInvocationID.xy * 2 + 1) << (pc.img_c - pc.iter - 1)) / pc.view - 1.0;
+    normCoord.y *= pc.view.y / pc.view.x;
 
-    float thresholdDist = 1.414213 / (gl_NumWorkGroups.x * gl_WorkGroupSize.x); // sqrt(2) / width
+    float thresholdDist = 1.4142135 / (gl_NumWorkGroups.x * gl_WorkGroupSize.x) * 2.0; // sqrt(2) / width
 
     vec3 fragPos = vec3(normCoord.x, 1.0, normCoord.y);
     fragPos = rotate(pc.rot, fragPos);
@@ -215,8 +211,7 @@ void main() {
     for (uint i = 0; i < maxSteps; i++) {
         vec3 position = fragPos + step * totalDist;
 
-        vec3 repPosition = repeat(position, vec3(10.0));
-        vec3 repFragPos = repeat(fragPos, vec3(10.0));
+        vec3 repPosition = repeat(position, vec3(10.0), sphere.xyz);
 
         float dist = length(repPosition) - sphere.w;
         float radius = (totalDist + dist + 1.0) * thresholdDist;
@@ -228,10 +223,6 @@ void main() {
     imageStore(imgs[pc.iter], ivec2(gl_GlobalInvocationID.xy), vec4(max(totalDist, 0.0)));
 }"
     }
-}
-
-fn to_position(vec: Vec2) -> PhysicalPosition<f32> {
-    PhysicalPosition::new(vec.x, vec.y)
 }
 
 fn select_physical_device<'a, W>(
@@ -332,23 +323,11 @@ fn get_compute_pipeline(
 
 fn get_graphics_descriptor_set(
     pipeline: Arc<GraphicsPipeline>,
-    queue: Arc<Queue>,
-    viewport: Viewport,
     image_view: Arc<dyn ImageViewAbstract>,
 ) -> Arc<PersistentDescriptorSet> {
-    let (uniform_buffer, _) = DeviceLocalBuffer::from_data(
-        viewport.dimensions,
-        BufferUsage::uniform_buffer(),
-        queue.clone(),
-    )
-    .unwrap();
-
     PersistentDescriptorSet::new(
         pipeline.layout().set_layouts()[0].clone(),
-        [
-            WriteDescriptorSet::buffer(0, uniform_buffer.clone()),
-            WriteDescriptorSet::image_view(1, image_view.clone()),
-        ],
+        [WriteDescriptorSet::image_view(0, image_view.clone())],
     )
     .unwrap()
 }
@@ -359,13 +338,72 @@ fn get_compute_descriptor_set(
 ) -> Arc<PersistentDescriptorSet> {
     PersistentDescriptorSet::new(
         pipeline.layout().set_layouts()[0].clone(),
-        [WriteDescriptorSet::image_view_array(
-            0,
-            0,
-            image_views.clone(),
-        )],
+        [WriteDescriptorSet::image_view_array(0, 0, image_views)],
     )
     .unwrap()
+}
+
+fn get_compute_images(
+    device: Arc<Device>,
+    queue: Arc<Queue>,
+    image_count: u32,
+    max_resolution: [f32; 2],
+) -> Vec<Arc<StorageImage>> {
+    let ratio = Vec2::from_array(max_resolution) / (4 << image_count) as f32;
+
+    let mut images = (0..image_count)
+        .map(|i| {
+            let dims = ((1 << i) as f32 * ratio).ceil().as_uvec2() * 8;
+
+            StorageImage::with_usage(
+                device.clone(),
+                ImageDimensions::Dim2d {
+                    width: dims.x,
+                    height: dims.y,
+                    array_layers: 1,
+                },
+                Format::R32_SFLOAT,
+                ImageUsage {
+                    storage: true,
+                    transfer_dst: true,
+                    ..ImageUsage::none()
+                },
+                ImageCreateFlags::none(),
+                [queue.family()],
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let empty_images = (image_count..COMPUTE_IMAGE_COUNT).map(|_| {
+        StorageImage::with_usage(
+            device.clone(),
+            ImageDimensions::Dim2d {
+                width: 1,
+                height: 1,
+                array_layers: 1,
+            },
+            Format::R32_SFLOAT,
+            ImageUsage {
+                storage: true,
+                ..ImageUsage::none()
+            },
+            ImageCreateFlags::none(),
+            [queue.family()],
+        )
+        .unwrap()
+    });
+
+    images.extend(empty_images);
+
+    images
+}
+
+fn get_compute_image_views(images: &Vec<Arc<StorageImage>>) -> Vec<Arc<dyn ImageViewAbstract>> {
+    images
+        .iter()
+        .map(|image| ImageView::new_default(image.clone()).unwrap() as _)
+        .collect::<Vec<Arc<dyn ImageViewAbstract>>>()
 }
 
 fn get_command_buffer<S>(
@@ -375,6 +413,7 @@ fn get_command_buffer<S>(
     compute_pipeline: Arc<ComputePipeline>,
     framebuffer: Arc<Framebuffer>,
     compute_images: &Vec<Arc<StorageImage>>,
+    compute_image_count: u32,
     push_constants: fragment_shader::ty::PushConstantData,
     graphics_descriptor_set: S,
     compute_descriptor_set: S,
@@ -398,11 +437,13 @@ where
             compute_descriptor_set.clone(),
         );
 
-    for (image, iter) in compute_images.iter().zip(0..) {
+    for (image, iter) in compute_images.iter().zip(0..compute_image_count) {
         let compute_pc = compute_shader::ty::PushConstantData {
-            iter,
             rot: push_constants.rot,
             pos: push_constants.pos,
+            iter,
+            view: push_constants.view,
+            img_c: compute_image_count,
         };
         let [w, h] = image.dimensions().width_height(); // assumes depth = 1
 
@@ -441,7 +482,7 @@ where
 
 #[allow(dead_code)]
 mod speed {
-    pub const MOVEMENT: f32 = 30.0;
+    pub const MOVEMENT: f32 = 25.0;
     pub const ROTATION: f32 = 1.0;
     pub const MOUSE: f32 = 1.0;
 }
@@ -521,9 +562,11 @@ fn main() {
     let surface = WindowBuilder::new()
         .build_vk_surface(&event_loop, instance.clone())
         .unwrap();
+    // BUG: spamming any key on application startup will make the window invisible
     surface.window().set_cursor_visible(false);
     surface
         .window()
+        // WARNING: not supported on Mac, web and mobile platforms
         .set_cursor_grab(CursorGrabMode::Confined)
         .unwrap();
 
@@ -610,42 +653,26 @@ fn main() {
     let mut push_constants = fragment_shader::ty::PushConstantData {
         rot: [0.0, 0.0, 0.0, 0.0],
         pos: [0.0, 0.0, 0.0],
+        view: viewport.dimensions,
+        _dummy0: [0u8; 4],
     };
 
-    // TODO: specify usage
-    // TODO: reconstruct on resize
-    let compute_images = (0..COMPUTE_IMAGE_COUNT)
-        .map(|i| {
-            let ratio = Vec2::new(1920.0, 1080.0) / (4 << COMPUTE_IMAGE_COUNT) as f32;
-            let dims = ((1 << i) as f32 * ratio).ceil().as_uvec2() * 8;
+    let mut compute_image_count = (viewport.dimensions[0] / 4.0).log2() as u32;
 
-            StorageImage::new(
-                device.clone(),
-                ImageDimensions::Dim2d {
-                    width: dims.x,
-                    height: dims.y,
-                    array_layers: 1,
-                },
-                Format::R32_SFLOAT,
-                Some(queue.family()),
-            )
-            .unwrap()
-        })
-        .collect::<Vec<_>>();
-
-    let compute_image_views = compute_images
-        .iter()
-        .map(|image| ImageView::new_default(image.clone()).unwrap() as _)
-        .collect::<Vec<Arc<dyn ImageViewAbstract>>>();
+    let mut compute_images = get_compute_images(
+        device.clone(),
+        queue.clone(),
+        compute_image_count,
+        viewport.dimensions,
+    );
+    let compute_image_views = get_compute_image_views(&compute_images);
 
     let mut graphics_descriptor_set = get_graphics_descriptor_set(
         graphics_pipeline.clone(),
-        queue.clone(),
-        viewport.clone(),
         compute_image_views.last().unwrap().clone(),
     );
 
-    let compute_descriptor_set =
+    let mut compute_descriptor_set =
         get_compute_descriptor_set(compute_pipeline.clone(), compute_image_views.clone());
 
     let mut command_buffers = vec![None; framebuffers.len()];
@@ -673,7 +700,15 @@ fn main() {
     event_helper
         .raw_mouse_delta(|data, (dx, dy)| data.cursor_delta += DVec2::new(dx, dy).as_vec2());
 
-    event_helper.focused(|data, focused| data.window_frozen = !focused);
+    event_helper.focused(|data, focused| {
+        data.window_frozen = !focused;
+        let window = data.window();
+        if focused {
+            window.set_cursor_grab(CursorGrabMode::Confined).unwrap();
+        } else {
+            window.set_cursor_grab(CursorGrabMode::None).unwrap();
+        }
+    });
 
     event_helper.resized(|data, size| {
         data.window_frozen = size.width == 0 || size.height == 0;
@@ -697,13 +732,6 @@ fn main() {
         if event_helper.quit {
             *control_flow = ControlFlow::Exit;
         }
-
-        // BUG: thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value: Os(OsError { line: 345, file: "C:\\Users\\gebruiker\\.cargo\\registry\\src\\github.com-1ecc6299db9ec823\\winit-0.27.2\\src\\platform_impl\\windows\\window.rs", error: Os { code: 0, kind: Uncategorized, message: "The operation completed successfully." } })'
-        // possible cause: window was not focused on startup, which has a chance of happening when a key is pressed during startup
-        event_helper
-            .window()
-            .set_cursor_position(to_position(event_helper.dimensions / 2.0))
-            .unwrap();
 
         let cursor_mov =
             event_helper.cursor_delta / event_helper.dimensions.y * speed::ROTATION * speed::MOUSE;
@@ -779,6 +807,7 @@ fn main() {
                 event_helper.window_resized = false;
 
                 viewport.dimensions = event_helper.dimensions.to_array();
+                push_constants.view = viewport.dimensions;
 
                 graphics_pipeline = get_graphics_pipeline(
                     device.clone(),
@@ -788,10 +817,23 @@ fn main() {
                     render_pass.clone(),
                 );
 
+                compute_image_count = (viewport.dimensions[0] / 4.0).log2().ceil() as u32;
+
+                compute_images = get_compute_images(
+                    device.clone(),
+                    queue.clone(),
+                    compute_image_count,
+                    viewport.dimensions,
+                );
+                let compute_image_views = get_compute_image_views(&compute_images);
+
+                compute_descriptor_set = get_compute_descriptor_set(
+                    compute_pipeline.clone(),
+                    compute_image_views.clone(),
+                );
+
                 graphics_descriptor_set = get_graphics_descriptor_set(
                     graphics_pipeline.clone(),
-                    queue.clone(),
-                    viewport.clone(),
                     compute_image_views.last().unwrap().clone(),
                 );
             }
@@ -818,6 +860,7 @@ fn main() {
             compute_pipeline.clone(),
             framebuffers[image_index].clone(),
             &compute_images, // TODO: add compute_image for each framebuffer
+            compute_image_count,
             push_constants.clone(),
             graphics_descriptor_set.clone(),
             compute_descriptor_set.clone(),
