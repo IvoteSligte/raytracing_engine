@@ -118,8 +118,8 @@ void main() {
 
     float totalDist = imageLoad(img, ivec2(gl_FragCoord.xy)).x;
 
-    // fragColor = vec4(totalDist / 100000.0, 0.0, 0.0, 1.0);
-    // return;
+    fragColor = vec4(totalDist / 1000.0, 0.0, 0.0, 1.0);
+    return;
 
     for (uint i = 0; i < maxSteps; i++) {
         vec3 position = fragPos + step * totalDist;
@@ -346,7 +346,7 @@ fn get_compute_descriptor_set(
 fn get_compute_images(
     device: Arc<Device>,
     queue: Arc<Queue>,
-    image_count: u32,
+    image_count: usize,
     max_resolution: [f32; 2],
 ) -> Vec<Arc<StorageImage>> {
     let ratio = Vec2::from_array(max_resolution) / (4 << image_count) as f32;
@@ -375,7 +375,7 @@ fn get_compute_images(
         })
         .collect::<Vec<_>>();
 
-    let empty_images = (image_count..COMPUTE_IMAGE_COUNT).map(|_| {
+    let null_images = (image_count..COMPUTE_IMAGE_COUNT).map(|_| {
         StorageImage::with_usage(
             device.clone(),
             ImageDimensions::Dim2d {
@@ -394,7 +394,7 @@ fn get_compute_images(
         .unwrap()
     });
 
-    images.extend(empty_images);
+    images.extend(null_images);
 
     images
 }
@@ -413,7 +413,7 @@ fn get_command_buffer<S>(
     compute_pipeline: Arc<ComputePipeline>,
     framebuffer: Arc<Framebuffer>,
     compute_images: &Vec<Arc<StorageImage>>,
-    compute_image_count: u32,
+    compute_image_count: usize,
     push_constants: fragment_shader::ty::PushConstantData,
     graphics_descriptor_set: S,
     compute_descriptor_set: S,
@@ -437,13 +437,13 @@ where
             compute_descriptor_set.clone(),
         );
 
-    for (image, iter) in compute_images.iter().zip(0..compute_image_count) {
+    for (image, i) in compute_images.iter().zip(0..compute_image_count) {
         let compute_pc = compute_shader::ty::PushConstantData {
             rot: push_constants.rot,
             pos: push_constants.pos,
-            iter,
+            iter: i as u32,
             view: push_constants.view,
-            img_c: compute_image_count,
+            img_c: compute_image_count as u32,
         };
         let [w, h] = image.dimensions().width_height(); // assumes depth = 1
 
@@ -496,17 +496,23 @@ mod rotation {
     pub const RIGHT: Vec3 = Vec3::new(1.0, 0.0, 0.0);
 }
 
-const COMPUTE_IMAGE_COUNT: u32 = 9;
+const COMPUTE_IMAGE_COUNT: usize = 9;
 
 struct Data<W> {
+    /// the window surface
     surface: Arc<Surface<W>>,
     window_frozen: bool,
     window_resized: bool,
     recreate_swapchain: bool,
+    /// viewport dimensions
     dimensions: Vec2,
+    /// change in cursor position
     cursor_delta: Vec2,
+    /// change in position relative to the rotation axes
     position: Vec3,
+    /// absolute rotation around the x and z axes
     rotation: Vec2,
+    /// time since the last update
     last_update: Instant,
     quit: bool,
 }
@@ -532,16 +538,14 @@ impl<W> Data<W> {
         Quat::from_rotation_z(-self.rotation.x) * Quat::from_rotation_x(self.rotation.y)
     }
 
-    fn up(&self) -> Vec3 {
-        self.rotation().mul_vec3(rotation::UP)
-    }
+    fn position(&self) -> Vec3 {
+        let rotation = self.rotation();
 
-    fn forward(&self) -> Vec3 {
-        self.rotation().mul_vec3(rotation::FORWARD)
-    }
+        let right = rotation.mul_vec3(rotation::RIGHT);
+        let forward = rotation.mul_vec3(rotation::FORWARD);
+        let up = rotation.mul_vec3(rotation::UP);
 
-    fn right(&self) -> Vec3 {
-        self.rotation().mul_vec3(rotation::RIGHT)
+        self.position.x * right + self.position.y * forward + self.position.z * up
     }
 }
 
@@ -657,7 +661,7 @@ fn main() {
         _dummy0: [0u8; 4],
     };
 
-    let mut compute_image_count = (viewport.dimensions[0] / 4.0).log2() as u32;
+    let mut compute_image_count = (viewport.dimensions[0] / 4.0).log2() as usize;
 
     let mut compute_images = get_compute_images(
         device.clone(),
@@ -669,7 +673,7 @@ fn main() {
 
     let mut graphics_descriptor_set = get_graphics_descriptor_set(
         graphics_pipeline.clone(),
-        compute_image_views.last().unwrap().clone(),
+        compute_image_views[compute_image_count - 1].clone(),
     );
 
     let mut compute_descriptor_set =
@@ -710,9 +714,16 @@ fn main() {
         }
     });
 
-    event_helper.resized(|data, size| {
+    event_helper.resized(|data, mut size| {
         data.window_frozen = size.width == 0 || size.height == 0;
         data.window_resized = true;
+
+        // the shaders are based on the assumption that width is less than height
+        if size.width < size.height {
+            size.height = size.width;
+            data.window().set_inner_size(size);
+        }
+
         data.dimensions = UVec2::new(size.width, size.height).as_vec2();
     });
 
@@ -725,63 +736,56 @@ fn main() {
     });
 
     event_loop.run(move |event, _, control_flow| {
-        if !event_helper.update(&event) || event_helper.window_frozen {
-            return;
-        }
-
         if event_helper.quit {
             *control_flow = ControlFlow::Exit;
         }
-
+        
+        if !event_helper.update(&event) || event_helper.window_frozen {
+            return;
+        }
+        
         let cursor_mov =
-            event_helper.cursor_delta / event_helper.dimensions.y * speed::ROTATION * speed::MOUSE;
+            event_helper.cursor_delta / event_helper.dimensions.x * speed::ROTATION * speed::MOUSE;
         event_helper.rotation += cursor_mov;
 
         event_helper.cursor_delta = Vec2::ZERO;
 
-        let rot_time = event_helper.rot_time();
-
         if event_helper.key_held(VirtualKeyCode::Left) {
-            event_helper.rotation.x += rot_time;
+            event_helper.rotation.x += event_helper.rot_time();
         }
         if event_helper.key_held(VirtualKeyCode::Right) {
-            event_helper.rotation.x -= rot_time;
+            event_helper.rotation.x -= event_helper.rot_time();
         }
         if event_helper.key_held(VirtualKeyCode::Up) {
-            event_helper.rotation.y -= rot_time;
+            event_helper.rotation.y -= event_helper.rot_time();
         }
         if event_helper.key_held(VirtualKeyCode::Down) {
-            event_helper.rotation.y += rot_time;
+            event_helper.rotation.y += event_helper.rot_time();
         }
 
         if event_helper.key_held(VirtualKeyCode::A) {
-            let change = event_helper.right() * event_helper.mov_time();
-            event_helper.position -= change;
+            event_helper.position.x -= event_helper.mov_time();
         }
         if event_helper.key_held(VirtualKeyCode::D) {
-            let change = event_helper.right() * event_helper.mov_time();
-            event_helper.position += change;
+            event_helper.position.x += event_helper.mov_time();
         }
         if event_helper.key_held(VirtualKeyCode::W) {
-            let change = event_helper.forward() * event_helper.mov_time();
-            event_helper.position += change;
+            event_helper.position.y += event_helper.mov_time();
         }
         if event_helper.key_held(VirtualKeyCode::S) {
-            let change = event_helper.forward() * event_helper.mov_time();
-            event_helper.position -= change;
+            event_helper.position.y -= event_helper.mov_time();
         }
         if event_helper.key_held(VirtualKeyCode::Q) {
-            let change = event_helper.up() * event_helper.mov_time();
-            event_helper.position += change;
+            event_helper.position.z += event_helper.mov_time();
         }
         if event_helper.key_held(VirtualKeyCode::E) {
-            let change = event_helper.up() * event_helper.mov_time();
-            event_helper.position -= change;
+            event_helper.position.z -= event_helper.mov_time();
         }
 
         event_helper.rotation.y = event_helper.rotation.y.clamp(-0.5 * PI, 0.5 * PI);
         push_constants.rot = event_helper.rotation().to_array();
-        push_constants.pos = event_helper.position.to_array();
+        push_constants.pos = (Vec3::from(push_constants.pos) + event_helper.position()).to_array();
+        event_helper.position = Vec3::ZERO;
 
         event_helper.last_update = Instant::now();
 
@@ -817,7 +821,7 @@ fn main() {
                     render_pass.clone(),
                 );
 
-                compute_image_count = (viewport.dimensions[0] / 4.0).log2().ceil() as u32;
+                compute_image_count = (viewport.dimensions[0] / 4.0).log2().ceil() as usize;
 
                 compute_images = get_compute_images(
                     device.clone(),
@@ -834,7 +838,7 @@ fn main() {
 
                 graphics_descriptor_set = get_graphics_descriptor_set(
                     graphics_pipeline.clone(),
-                    compute_image_views.last().unwrap().clone(),
+                    compute_image_views[compute_image_count - 1].clone(),
                 );
             }
         }
