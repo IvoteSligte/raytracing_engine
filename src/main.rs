@@ -77,32 +77,42 @@ layout(binding = 0, r32f) uniform readonly image2D img;
 layout(location = 0) out vec4 fragColor;
 
 // object
-const vec4 sphere = vec4(0.0, 4.0, 0.0, 2.0); // w = radius
+const vec4 sphere = vec4(2.0, 0.0, 0.0, 2.0); // w = radius
 const vec3 colorMat = vec3(0.2, 0.2, 1.0);
 const float specularMat = 1.0;
 const float diffuseMat = 1.0;
-const float shineMat = 1.0;
+const float shineMat = 10.0;
 
 // scene
 const float ambientScene = 0.2;
 
 // camera
+const float renderDist = 1000.0;
 const float camFallOffFactor = 0.001;
-const uint maxSteps = 100;
 const float minStep = 0.01;
 
 // light
-vec4 light = vec4(5.0, 5.0, 0.0, 10.0); // w = strength
+vec4 light = vec4(2.0, 2.0, 2.0, 1.0); // w = strength
+const float lightFallOffFactor = 0.01;
 
 vec3 rotate(vec4 q, vec3 v) {
     vec3 t = cross(q.xyz, v) + q.w * v;
     return v + 2.0 * cross(q.xyz, t);
 }
 
-// modified iq infinite repetition
-// p = point, r = repetition radius, c = repetition center
-vec3 repeat(vec3 p, vec3 r, vec3 c) {
-    return mod(p - c + 0.5*r, r) - 0.5*r;
+// iq infinite repetition
+vec3 repeat(vec3 p, vec3 r) {
+    return mod(p + 0.5*r, r) - 0.5*r;
+}
+
+float diffuse(vec3 normal, vec3 lightDir) {
+    return max(dot(normal, -lightDir), 0.0);
+}
+
+// TODO: fix
+float specular(vec3 normal, vec3 lightDir, vec3 camDir) {
+    vec3 reflection = reflect(lightDir, normal);
+    return max(pow(dot(reflection, camDir), shineMat), 0.0);
 }
 
 void main() {
@@ -118,20 +128,17 @@ void main() {
 
     float totalDist = imageLoad(img, ivec2(gl_FragCoord.xy)).x;
 
-    fragColor = vec4(totalDist / 1000.0, 0.0, 0.0, 1.0);
-    return;
-
-    for (uint i = 0; i < maxSteps; i++) {
+    while (totalDist < renderDist) {
         vec3 position = fragPos + step * totalDist;
-        vec3 repPosition = repeat(position, vec3(10.0), sphere.xyz);
 
+        vec3 repPosition = repeat(position - sphere.xyz, vec3(10.0));
         float dist = length(repPosition) - sphere.w;
         if (dist <= 0.0) {
             // light
-            vec3 lightDir = normalize(light.xyz - repPosition);
+            vec3 lightDir = normalize(position - light.xyz);
 
-            float lightDist = distance(repPosition, light.xyz);
-            float lightDistFallOff = lightDist * lightDist;
+            float lightDist = distance(position, light.xyz);
+            float lightDistFallOff = max(lightFallOffFactor * lightDist * lightDist, 0.1);
             
             // camera
             float camDist = distance(position, fragPos);
@@ -139,17 +146,16 @@ void main() {
 
             // object
             vec3 normal = normalize(repPosition);
-            vec3 reflection = reflect(lightDir, normal);
+            
+            float diffuse = diffuse(normal, lightDir);
+            float specular = specular(normal, lightDir, -step);
 
-            float diffuse = max(dot(normal, lightDir), 0.0) * light.w * diffuseMat;
-            // fix specular
-            float specular = pow(max(dot(reflection, -step), 0.0), shineMat) * specularMat;
+            float direct = (diffuse + specular) * light.w / lightDistFallOff;
 
-            float direct = (diffuse + specular) / lightDistFallOff;
-
-            fragColor = vec4((ambientScene + direct) * colorMat / camDistFallOff, 1.0);
+            fragColor = vec4((ambientScene + direct) * colorMat * dot(normal, -step) / camDistFallOff, 1.0);
             return;
         }
+
         totalDist += dist + minStep;
     }
     fragColor = vec4(0.0, 0.0, 0.0, 1.0);
@@ -170,33 +176,37 @@ layout(push_constant) uniform PushConstantData {
     vec3 pos;
     uint iter;
     vec2 view;
-    uint img_c; // image count
+    uint max_img; // highest image index
 } pc;
 
 // 9 images allows for a maximum resolution of 2048x2048 pixels
 layout(binding = 0, r32f) uniform image2D imgs[9];
 
 // sphere
-const vec4 sphere = vec4(0.0, 4.0, 0.0, 2.0); // w = radius
+const vec4 sphere = vec4(2.0, 0.0, 0.0, 2.0); // w = radius
 
 // camera
-const uint maxSteps = 1000;
+const float renderDist = 1000.0;
 
 vec3 rotate(vec4 q, vec3 v) {
     vec3 t = cross(q.xyz, v) + q.w * v;
     return v + 2.0 * cross(q.xyz, t);
 }
 
-// p = point, r = repetition radius, c = repetition center
-vec3 repeat(vec3 p, vec3 r, vec3 c) {
-    return mod(p - c + 0.5*r, r) - 0.5*r;
+// p = point, r = repetition radius
+vec3 repeat(vec3 p, vec3 r) {
+    return mod(p + 0.5*r, r) - 0.5*r;
 }
 
 void main() {
-    vec2 normCoord = ((gl_GlobalInvocationID.xy * 2 + 1) << (pc.img_c - pc.iter - 1)) / pc.view - 1.0;
+    uint unitSize = 1 << (pc.max_img - pc.iter);
+
+    vec2 normCoord = ((gl_GlobalInvocationID.xy * 2 + 1) * unitSize) / pc.view - 1.0;
     normCoord.y *= pc.view.y / pc.view.x;
 
-    float thresholdDist = 1.4142135 / (gl_NumWorkGroups.x * gl_WorkGroupSize.x) * 2.0; // sqrt(2) / width
+    // could be provided as push constant
+    // sqrt(2) * (nearest ceil base 2 of image width) / (screen width in pixels)
+    float thresholdDist = 1.4142135 * gl_WorkGroupSize.x * unitSize / pc.view.x;
 
     vec3 fragPos = vec3(normCoord.x, 1.0, normCoord.y);
     fragPos = rotate(pc.rot, fragPos);
@@ -208,14 +218,14 @@ void main() {
         totalDist = imageLoad(imgs[pc.iter - 1], ivec2(gl_GlobalInvocationID.xy / 2)).r;
     }
 
-    for (uint i = 0; i < maxSteps; i++) {
+    while (totalDist < renderDist) {
         vec3 position = fragPos + step * totalDist;
 
-        vec3 repPosition = repeat(position, vec3(10.0), sphere.xyz);
+        vec3 repPosition = repeat(position - sphere.xyz, vec3(10.0));
 
         float dist = length(repPosition) - sphere.w;
         float radius = (totalDist + dist + 1.0) * thresholdDist;
-        if (dist < radius) {
+        if (dist <= radius) {
             break;
         }
         totalDist += dist;
@@ -351,7 +361,7 @@ fn get_compute_images(
 ) -> Vec<Arc<StorageImage>> {
     let ratio = Vec2::from_array(max_resolution) / (4 << image_count) as f32;
 
-    let mut images = (0..image_count)
+    (0..image_count)
         .map(|i| {
             let dims = ((1 << i) as f32 * ratio).ceil().as_uvec2() * 8;
 
@@ -373,37 +383,39 @@ fn get_compute_images(
             )
             .unwrap()
         })
-        .collect::<Vec<_>>();
-
-    let null_images = (image_count..COMPUTE_IMAGE_COUNT).map(|_| {
-        StorageImage::with_usage(
-            device.clone(),
-            ImageDimensions::Dim2d {
-                width: 1,
-                height: 1,
-                array_layers: 1,
-            },
-            Format::R32_SFLOAT,
-            ImageUsage {
-                storage: true,
-                ..ImageUsage::none()
-            },
-            ImageCreateFlags::none(),
-            [queue.family()],
-        )
-        .unwrap()
-    });
-
-    images.extend(null_images);
-
-    images
+        .collect::<Vec<_>>()
 }
 
-fn get_compute_image_views(images: &Vec<Arc<StorageImage>>) -> Vec<Arc<dyn ImageViewAbstract>> {
-    images
+fn get_compute_image_views(
+    device: Arc<Device>,
+    queue: Arc<Queue>,
+    images: &Vec<Arc<StorageImage>>,
+) -> Vec<Arc<dyn ImageViewAbstract>> {
+    let mut image_views = images
         .iter()
         .map(|image| ImageView::new_default(image.clone()).unwrap() as _)
-        .collect::<Vec<Arc<dyn ImageViewAbstract>>>()
+        .collect::<Vec<Arc<dyn ImageViewAbstract>>>();
+
+    let null_image = StorageImage::new(
+        device.clone(),
+        ImageDimensions::Dim2d {
+            width: 1,
+            height: 1,
+            array_layers: 1,
+        },
+        Format::R32_SFLOAT,
+        [queue.family()],
+    )
+    .unwrap();
+
+    let null_image_view = ImageView::new_default(null_image).unwrap();
+
+    image_views.append(&mut vec![
+        null_image_view;
+        COMPUTE_IMAGE_COUNT - images.len()
+    ]);
+
+    image_views
 }
 
 fn get_command_buffer<S>(
@@ -443,7 +455,7 @@ where
             pos: push_constants.pos,
             iter: i as u32,
             view: push_constants.view,
-            img_c: compute_image_count as u32,
+            max_img: compute_image_count as u32 - 1,
         };
         let [w, h] = image.dimensions().width_height(); // assumes depth = 1
 
@@ -650,10 +662,6 @@ fn main() {
         render_pass.clone(),
     );
 
-    let compute_shader = compute_shader::load(device.clone()).unwrap();
-
-    let compute_pipeline = get_compute_pipeline(device.clone(), compute_shader.clone());
-
     let mut push_constants = fragment_shader::ty::PushConstantData {
         rot: [0.0, 0.0, 0.0, 0.0],
         pos: [0.0, 0.0, 0.0],
@@ -661,7 +669,11 @@ fn main() {
         _dummy0: [0u8; 4],
     };
 
-    let mut compute_image_count = (viewport.dimensions[0] / 4.0).log2() as usize;
+    let compute_shader = compute_shader::load(device.clone()).unwrap();
+
+    let compute_pipeline = get_compute_pipeline(device.clone(), compute_shader.clone());
+
+    let mut compute_image_count = (viewport.dimensions[0] / 8.0).log2() as usize + 1;
 
     let mut compute_images = get_compute_images(
         device.clone(),
@@ -669,7 +681,7 @@ fn main() {
         compute_image_count,
         viewport.dimensions,
     );
-    let compute_image_views = get_compute_image_views(&compute_images);
+    let compute_image_views = get_compute_image_views(device.clone(), queue.clone(), &compute_images);
 
     let mut graphics_descriptor_set = get_graphics_descriptor_set(
         graphics_pipeline.clone(),
@@ -739,11 +751,11 @@ fn main() {
         if event_helper.quit {
             *control_flow = ControlFlow::Exit;
         }
-        
+
         if !event_helper.update(&event) || event_helper.window_frozen {
             return;
         }
-        
+
         let cursor_mov =
             event_helper.cursor_delta / event_helper.dimensions.x * speed::ROTATION * speed::MOUSE;
         event_helper.rotation += cursor_mov;
@@ -751,10 +763,10 @@ fn main() {
         event_helper.cursor_delta = Vec2::ZERO;
 
         if event_helper.key_held(VirtualKeyCode::Left) {
-            event_helper.rotation.x += event_helper.rot_time();
+            event_helper.rotation.x -= event_helper.rot_time();
         }
         if event_helper.key_held(VirtualKeyCode::Right) {
-            event_helper.rotation.x -= event_helper.rot_time();
+            event_helper.rotation.x += event_helper.rot_time();
         }
         if event_helper.key_held(VirtualKeyCode::Up) {
             event_helper.rotation.y -= event_helper.rot_time();
@@ -821,7 +833,7 @@ fn main() {
                     render_pass.clone(),
                 );
 
-                compute_image_count = (viewport.dimensions[0] / 4.0).log2().ceil() as usize;
+                compute_image_count = (viewport.dimensions[0] / 8.0).log2().ceil() as usize + 1;
 
                 compute_images = get_compute_images(
                     device.clone(),
@@ -829,7 +841,7 @@ fn main() {
                     compute_image_count,
                     viewport.dimensions,
                 );
-                let compute_image_views = get_compute_image_views(&compute_images);
+                let compute_image_views = get_compute_image_views(device.clone(), queue.clone(), &compute_images);
 
                 compute_descriptor_set = get_compute_descriptor_set(
                     compute_pipeline.clone(),
