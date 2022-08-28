@@ -1,7 +1,9 @@
 use std::{f32::consts::PI, sync::Arc, time::Instant};
 
+use fps_counter::FPSCounter;
 use glam::{DVec2, Quat, UVec2, Vec2, Vec3};
 use vulkano::{
+    buffer::{BufferAccess, BufferUsage, DeviceLocalBuffer},
     command_buffer::{
         AutoCommandBufferBuilder, ClearColorImageInfo, CommandBufferUsage,
         PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassContents,
@@ -63,8 +65,11 @@ void main() {
 mod fragment_shader {
     vulkano_shaders::shader! {
         ty: "fragment",
+        types_meta: { #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)] },
         src: "
 #version 460
+
+layout(location = 0) out vec4 fragColor;
 
 layout(push_constant) uniform PushConstantData {
     vec4 rot;
@@ -72,27 +77,49 @@ layout(push_constant) uniform PushConstantData {
     vec2 view;
 } pc;
 
+// direct depth image (compute)
 layout(binding = 0, r32f) uniform readonly image2D img;
 
-layout(location = 0) out vec4 fragColor;
+// materials
+const uint MAX_MATERIALS = 8;
 
-// object
-const vec4 sphere = vec4(2.0, 0.0, 0.0, 2.0); // w = radius
-const vec3 colorMat = vec3(0.2, 0.2, 1.0);
-const float specularMat = 1.0;
-const float diffuseMat = 1.0;
-const float shineMat = 10.0;
+struct Material {
+    vec3 color;
+    float diffuse;
+    float specular;
+    float shine;
+};
+
+// material
+layout(binding = 1) uniform readonly ImmutableData {
+    // TODO: implement object-material indexing
+    Material mats[MAX_MATERIALS];
+} buf;
+
+// objects
+const uint MAX_OBJECTS = 8;
+
+struct Object {
+    vec3 pos;
+    float size;
+};
+
+layout(binding = 2) uniform readonly MutableData {
+    uint matCount;
+    uint objCount;
+    Object objs[MAX_OBJECTS];
+} mutBuf;
 
 // scene
 const float ambientScene = 0.2;
 
 // camera
 const float renderDist = 1000.0;
-const float camFallOffFactor = 0.001;
-const float minStep = 0.01;
+const float camFallOffFactor = 0.01;
 
 // light
-vec4 light = vec4(2.0, 2.0, 2.0, 1.0); // w = strength
+// TODO: implement multiple light source support
+vec4 light = vec4(4.0, 2.0, 2.0, 1.0); // w = strength
 const float lightFallOffFactor = 0.01;
 
 vec3 rotate(vec4 q, vec3 v) {
@@ -106,70 +133,83 @@ vec3 repeat(vec3 p, vec3 r) {
 }
 
 float diffuse(vec3 normal, vec3 lightDir) {
-    return max(dot(normal, -lightDir), 0.0);
+    return max(dot(normal, lightDir), 0.0);
 }
 
-// TODO: fix
-float specular(vec3 normal, vec3 lightDir, vec3 camDir) {
-    vec3 reflection = reflect(lightDir, normal);
-    return max(pow(dot(reflection, camDir), shineMat), 0.0);
+float specular(vec3 normal, vec3 lightDir, vec3 camDir, float diffuse, float shine) {
+    vec3 reflection = reflect(-lightDir, normal);
+    return diffuse * pow(max(dot(reflection, camDir), 0.0), shine);
 }
 
+float sphereSDF(vec3 p, Object s) {
+    return distance(p, s.pos) - s.size;
+}
+
+// TODO: implement custom FOVs
 void main() {
     // maps FragCoord to xy range [-1.0, 1.0]
     vec2 normCoord = gl_FragCoord.xy * 2 / pc.view - 1.0;
     // assuming height <= width, width = 1.0 and height <= 1.0
-    normCoord.y *= pc.view.y / pc.view.x;
+    normCoord.y *= pc.view.y / pc.view.x; // TODO: move to CPU
 
-    vec3 fragPos = vec3(normCoord.x, 1.0, normCoord.y);
-    fragPos = rotate(pc.rot, fragPos);
-    vec3 step = normalize(fragPos);
-    fragPos += pc.pos;
+    vec3 step = normalize(rotate(pc.rot, vec3(normCoord.x, 1.0, normCoord.y)));
 
     float totalDist = imageLoad(img, ivec2(gl_FragCoord.xy)).x;
 
-    while (totalDist < renderDist) {
-        vec3 position = fragPos + step * totalDist;
-
-        vec3 repPosition = repeat(position - sphere.xyz, vec3(10.0));
-        float dist = length(repPosition) - sphere.w;
-        if (dist <= 0.0) {
-            // light
-            vec3 lightDir = normalize(position - light.xyz);
-
-            float lightDist = distance(position, light.xyz);
-            float lightDistFallOff = max(lightFallOffFactor * lightDist * lightDist, 0.1);
-            
-            // camera
-            float camDist = distance(position, fragPos);
-            float camDistFallOff = max(camFallOffFactor * (camDist * camDist + 1.0), 1.0);
-
-            // object
-            vec3 normal = normalize(repPosition);
-            
-            float diffuse = diffuse(normal, lightDir);
-            float specular = specular(normal, lightDir, -step);
-
-            float direct = (diffuse + specular) * light.w / lightDistFallOff;
-
-            fragColor = vec4((ambientScene + direct) * colorMat * dot(normal, -step) / camDistFallOff, 1.0);
-            return;
-        }
-
-        totalDist += dist + minStep;
+    if (totalDist >= renderDist) {
+        fragColor.xyz = vec3(0.0);
+        return;
     }
-    fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+
+    vec3 position = pc.pos + step * totalDist;
+
+    Object object = mutBuf.objs[0];
+    Material mat = buf.mats[0];
+    float dist = sphereSDF(position, object);
+
+    for (uint i = 1; i < mutBuf.objCount; i++) {
+        Object newObject = mutBuf.objs[i];
+        float newDist = sphereSDF(position, newObject);
+        if (newDist < dist) {
+            object = newObject;
+            dist = newDist;
+            mat = buf.mats[i];
+        }
+    }
+
+    // light
+    vec3 lightDir = normalize(light.xyz - position);
+
+    float lightDist = distance(position, light.xyz);
+    float lightDistFallOff = max(lightFallOffFactor * lightDist * lightDist, 0.1);
+
+    // camera
+    float camDist = distance(position, pc.pos);
+    float camDistFallOff = max(camFallOffFactor * (camDist * camDist + 1.0), 1.0);
+
+    // object
+    // WARNING: only works for spheres
+    vec3 normal = normalize(position - object.pos);
+    
+    float diffuse = diffuse(normal, lightDir);
+    float specular = specular(normal, lightDir, -step, diffuse, mat.shine);
+
+    float direct = max(diffuse + specular, 0.0) * light.w / lightDistFallOff;
+
+    fragColor.xyz = (ambientScene + direct) / camDistFallOff * dot(normal, -step) * mat.color;
 }"
     }
 }
 
+// TODO: increase initial resolution to MAX_RES / 16 or MAX_RES / 32
 mod compute_shader {
     vulkano_shaders::shader! {
         ty: "compute",
+        types_meta: { #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)] },
         src: "
 #version 460
 
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(push_constant) uniform PushConstantData {
     vec4 rot;
@@ -182,8 +222,19 @@ layout(push_constant) uniform PushConstantData {
 // 9 images allows for a maximum resolution of 2048x2048 pixels
 layout(binding = 0, r32f) uniform image2D imgs[9];
 
-// sphere
-const vec4 sphere = vec4(2.0, 0.0, 0.0, 2.0); // w = radius
+// objects
+const uint MAX_OBJECTS = 8;
+
+struct Object {
+    vec3 pos;
+    float size;
+};
+
+layout(binding = 1) uniform readonly MutableData {
+    uint matCount;
+    uint objCount;
+    Object objs[MAX_OBJECTS];
+} mutBuf;
 
 // camera
 const float renderDist = 1000.0;
@@ -198,37 +249,94 @@ vec3 repeat(vec3 p, vec3 r) {
     return mod(p + 0.5*r, r) - 0.5*r;
 }
 
+float sphereSDF(vec3 p, Object s) {
+    return distance(p, s.pos) - s.size;
+}
+
+// TODO: make cpu provide general values
 void main() {
-    uint unitSize = 1 << (pc.max_img - pc.iter);
+    uint unitSize = 1 << (pc.max_img - pc.iter); // TODO: move to CPU
 
     vec2 normCoord = ((gl_GlobalInvocationID.xy * 2 + 1) * unitSize) / pc.view - 1.0;
-    normCoord.y *= pc.view.y / pc.view.x;
+    normCoord.y *= pc.view.y / pc.view.x; // TODO: move to CPU
 
-    // could be provided as push constant
     // sqrt(2) * (nearest ceil base 2 of image width) / (screen width in pixels)
-    float thresholdDist = 1.4142135 * gl_WorkGroupSize.x * unitSize / pc.view.x;
+    float thresholdDist = 1.4142135 * gl_WorkGroupSize.x * unitSize / pc.view.x; // TODO: move to CPU
 
-    vec3 fragPos = vec3(normCoord.x, 1.0, normCoord.y);
-    fragPos = rotate(pc.rot, fragPos);
-    vec3 step = normalize(fragPos);
-    fragPos += pc.pos;
+    vec3 step = normalize(rotate(pc.rot, vec3(normCoord.x, 1.0, normCoord.y)));
 
-    float totalDist = 0.0;
+    float totalDist = 1.0;
     if (pc.iter > 0) {
-        totalDist = imageLoad(imgs[pc.iter - 1], ivec2(gl_GlobalInvocationID.xy / 2)).r;
+        totalDist = imageLoad(imgs[pc.iter - 1], ivec2(gl_GlobalInvocationID.xy * 0.5)).r;
     }
 
+    float distances[MAX_OBJECTS];
+
+    for (uint i = 0; i < mutBuf.objCount; i++) {
+        distances[i] = 0.0;
+    }
+
+    uint closest = 0;
+    float nearest = 0.0;
+
+    //for (uint j = 0; j < 100; j++) {
     while (totalDist < renderDist) {
-        vec3 position = fragPos + step * totalDist;
+        vec3 position = pc.pos + step * totalDist;
 
-        vec3 repPosition = repeat(position - sphere.xyz, vec3(10.0));
+        
+        // algorithm 3
+        float dist = 1000000.0;
+        // multiplying by 2.0 ''fixes'' a bug
+        float radius = (totalDist + 1.0) * thresholdDist;
+        for (uint i = 0; i < mutBuf.objCount; i++) {
+            distances[i] -= nearest;
+            if (distances[i] <= radius + nearest) {
+                distances[i] = sphereSDF(position, mutBuf.objs[i]);
+            }
+            dist = min(dist, distances[i]);
+        }
+        nearest = max(dist, 0.0);
 
-        float dist = length(repPosition) - sphere.w;
-        float radius = (totalDist + dist + 1.0) * thresholdDist;
+        totalDist += nearest;
+        radius = (totalDist + 1.0) * thresholdDist;
         if (dist <= radius) {
+            totalDist -= radius;
             break;
         }
-        totalDist += dist;
+        
+
+        // // algorithm 2: only checks real distance when necessary
+        // for (uint i = 0; i < mutBuf.objCount; i++) {
+        //     distances[i] -= nearest;
+        //     if (distances[i] < distances[closest]) {
+        //         closest = i;
+        //     }
+        // }
+
+        // nearest = distances[closest];
+        // totalDist += nearest;
+        // distances[closest] = sphereSDF(position, mutBuf.objs[closest]);
+        
+        // float radius = (totalDist + 1.0) * thresholdDist;
+        // if (distances[closest] <= radius) {
+        //     totalDist += distances[closest] - radius;
+        //     break;
+        // }
+
+        
+        // algorithm 1: checks real distance for each object every update
+        // float dist = sphereSDF(position, mutBuf.objs[0]);
+        // for (uint i = 1; i < mutBuf.objCount; i++) {
+        //     float newDist = sphereSDF(position, mutBuf.objs[i]);
+        //     dist = min(dist, newDist);
+        // }
+
+        // totalDist += dist;
+        // float radius = (totalDist + 1.0) * thresholdDist;
+        // if (dist <= radius) {
+        //     totalDist -= radius;
+        //     break;
+        // }
     }
     imageStore(imgs[pc.iter], ivec2(gl_GlobalInvocationID.xy), vec4(max(totalDist, 0.0)));
 }"
@@ -334,10 +442,16 @@ fn get_compute_pipeline(
 fn get_graphics_descriptor_set(
     pipeline: Arc<GraphicsPipeline>,
     image_view: Arc<dyn ImageViewAbstract>,
+    immutable_buffer: Arc<dyn BufferAccess>,
+    mutable_buffer: Arc<dyn BufferAccess>,
 ) -> Arc<PersistentDescriptorSet> {
     PersistentDescriptorSet::new(
         pipeline.layout().set_layouts()[0].clone(),
-        [WriteDescriptorSet::image_view(0, image_view.clone())],
+        [
+            WriteDescriptorSet::image_view(0, image_view.clone()),
+            WriteDescriptorSet::buffer(1, immutable_buffer),
+            WriteDescriptorSet::buffer(2, mutable_buffer),
+        ],
     )
     .unwrap()
 }
@@ -345,10 +459,14 @@ fn get_graphics_descriptor_set(
 fn get_compute_descriptor_set(
     pipeline: Arc<ComputePipeline>,
     image_views: Vec<Arc<dyn ImageViewAbstract>>,
+    mutable_buffer: Arc<dyn BufferAccess>,
 ) -> Arc<PersistentDescriptorSet> {
     PersistentDescriptorSet::new(
         pipeline.layout().set_layouts()[0].clone(),
-        [WriteDescriptorSet::image_view_array(0, 0, image_views)],
+        [
+            WriteDescriptorSet::image_view_array(0, 0, image_views),
+            WriteDescriptorSet::buffer(1, mutable_buffer),
+        ],
     )
     .unwrap()
 }
@@ -627,7 +745,7 @@ fn main() {
             .0,
     );
 
-    let (mut swapchain, images) = Swapchain::new(
+    let (mut swapchain, swapchain_images) = Swapchain::new(
         device.clone(),
         surface.clone(),
         SwapchainCreateInfo {
@@ -643,7 +761,7 @@ fn main() {
 
     let render_pass = get_render_pass(device.clone(), swapchain.clone());
 
-    let mut framebuffers = get_framebuffers(&images, render_pass.clone());
+    let mut framebuffers = get_framebuffers(&swapchain_images, render_pass.clone());
 
     let vertex_shader = vertex_shader::load(device.clone()).unwrap();
     let fragment_shader = fragment_shader::load(device.clone()).unwrap();
@@ -661,6 +779,78 @@ fn main() {
         viewport.clone(),
         render_pass.clone(),
     );
+
+    const MATERIALS: [fragment_shader::ty::Material; 4] = [
+        fragment_shader::ty::Material {
+            color: [0.2, 0.2, 1.0],
+            diffuse: 1.0,
+            specular: 1.0,
+            shine: 1.0,
+            _dummy0: [0u8; 8],
+        },
+        fragment_shader::ty::Material {
+            color: [0.0, 1.0, 0.0],
+            diffuse: 1.0,
+            specular: 1.0,
+            shine: 1.0,
+            _dummy0: [0u8; 8],
+        },
+        fragment_shader::ty::Material {
+            color: [1.0, 1.0, 0.0],
+            diffuse: 1.0,
+            specular: 1.0,
+            shine: 1.0,
+            _dummy0: [0u8; 8],
+        },
+        fragment_shader::ty::Material {
+            color: [1.0, 0.0, 0.0],
+            diffuse: 1.0,
+            specular: 1.0,
+            shine: 1.0,
+            _dummy0: [0u8; 8],
+        },
+    ];
+
+    let (immutable_buffer, immutable_future) =
+        DeviceLocalBuffer::from_data(MATERIALS, BufferUsage::uniform_buffer(), queue.clone())
+            .unwrap();
+
+    let objects = [
+        fragment_shader::ty::Object {
+            pos: [3.0, 5.0, -1.0],
+            size: 3.0,
+        },
+        fragment_shader::ty::Object {
+            pos: [5.0, 4.0, 5.0],
+            size: 6.0,
+        },
+        fragment_shader::ty::Object {
+            pos: [-0.0, 3.0, -0.0],
+            size: 1.0,
+        },
+        fragment_shader::ty::Object {
+            pos: [4.0, 1.0, 0.0],
+            size: 2.0,
+        },
+    ];
+
+    let mut mutable_data = fragment_shader::ty::MutableData {
+        matCount: MATERIALS.len() as u32,
+        objCount: objects.len() as u32,
+        ..Default::default()
+    };
+    mutable_data.objs[..objects.len()].copy_from_slice(&objects);
+    
+    let (mutable_buffer, mutable_future) =
+        DeviceLocalBuffer::from_data(mutable_data, BufferUsage::uniform_buffer(), queue.clone())
+            .unwrap();
+
+    immutable_future
+        .join(mutable_future)
+        .then_signal_fence_and_flush()
+        .unwrap()
+        .wait(None)
+        .unwrap();
 
     let mut push_constants = fragment_shader::ty::PushConstantData {
         rot: [0.0, 0.0, 0.0, 0.0],
@@ -681,22 +871,28 @@ fn main() {
         compute_image_count,
         viewport.dimensions,
     );
-    let compute_image_views = get_compute_image_views(device.clone(), queue.clone(), &compute_images);
+    let compute_image_views =
+        get_compute_image_views(device.clone(), queue.clone(), &compute_images);
 
     let mut graphics_descriptor_set = get_graphics_descriptor_set(
         graphics_pipeline.clone(),
         compute_image_views[compute_image_count - 1].clone(),
+        immutable_buffer.clone(),
+        mutable_buffer.clone(),
     );
 
-    let mut compute_descriptor_set =
-        get_compute_descriptor_set(compute_pipeline.clone(), compute_image_views.clone());
+    let mut compute_descriptor_set = get_compute_descriptor_set(
+        compute_pipeline.clone(),
+        compute_image_views.clone(),
+        mutable_buffer.clone(),
+    );
 
     let mut command_buffers = vec![None; framebuffers.len()];
 
-    let mut fences: Vec<Option<Arc<FenceSignalFuture<_>>>> = vec![None; images.len()];
+    let mut fences: Vec<Option<Arc<FenceSignalFuture<_>>>> = vec![None; swapchain_images.len()];
     let mut previous_fence_index = 0;
 
-    let mut event_helper = EventHelper::new(Data {
+    let mut eh = EventHelper::new(Data {
         surface,
         window_frozen: false,
         window_resized: false,
@@ -709,14 +905,13 @@ fn main() {
         quit: false,
     });
 
-    let exit = |data: &mut Data<Window>| data.quit = true;
-    event_helper.close_requested(exit);
-    event_helper.keyboard(VirtualKeyCode::Escape, ElementState::Pressed, exit);
+    let exit = |data: &mut EventHelper<Data<_>>| data.quit = true;
+    eh.close_requested(exit);
+    eh.keyboard(VirtualKeyCode::Escape, ElementState::Pressed, exit);
 
-    event_helper
-        .raw_mouse_delta(|data, (dx, dy)| data.cursor_delta += DVec2::new(dx, dy).as_vec2());
+    eh.raw_mouse_delta(|data, (dx, dy)| data.cursor_delta += DVec2::new(dx, dy).as_vec2());
 
-    event_helper.focused(|data, focused| {
+    eh.focused(|data, focused| {
         data.window_frozen = !focused;
         let window = data.window();
         if focused {
@@ -726,7 +921,7 @@ fn main() {
         }
     });
 
-    event_helper.resized(|data, mut size| {
+    eh.resized(|data, mut size| {
         data.window_frozen = size.width == 0 || size.height == 0;
         data.window_resized = true;
 
@@ -739,7 +934,7 @@ fn main() {
         data.dimensions = UVec2::new(size.width, size.height).as_vec2();
     });
 
-    event_helper.keyboard(VirtualKeyCode::F11, ElementState::Pressed, |data| {
+    eh.keyboard(VirtualKeyCode::F11, ElementState::Pressed, |data| {
         let window = data.window();
         match window.fullscreen() {
             Some(_) => window.set_fullscreen(None),
@@ -747,65 +942,68 @@ fn main() {
         }
     });
 
+    let mut fps_counter = FPSCounter::new();
+
     event_loop.run(move |event, _, control_flow| {
-        if event_helper.quit {
+        if eh.quit {
             *control_flow = ControlFlow::Exit;
         }
 
-        if !event_helper.update(&event) || event_helper.window_frozen {
+        if !eh.update(&event) || eh.window_frozen {
             return;
         }
 
-        let cursor_mov =
-            event_helper.cursor_delta / event_helper.dimensions.x * speed::ROTATION * speed::MOUSE;
-        event_helper.rotation += cursor_mov;
+        println!("{}", fps_counter.tick());
 
-        event_helper.cursor_delta = Vec2::ZERO;
+        let cursor_mov = eh.cursor_delta / eh.dimensions.x * speed::ROTATION * speed::MOUSE;
+        eh.rotation += cursor_mov;
 
-        if event_helper.key_held(VirtualKeyCode::Left) {
-            event_helper.rotation.x -= event_helper.rot_time();
-        }
-        if event_helper.key_held(VirtualKeyCode::Right) {
-            event_helper.rotation.x += event_helper.rot_time();
-        }
-        if event_helper.key_held(VirtualKeyCode::Up) {
-            event_helper.rotation.y -= event_helper.rot_time();
-        }
-        if event_helper.key_held(VirtualKeyCode::Down) {
-            event_helper.rotation.y += event_helper.rot_time();
-        }
+        eh.cursor_delta = Vec2::ZERO;
 
-        if event_helper.key_held(VirtualKeyCode::A) {
-            event_helper.position.x -= event_helper.mov_time();
+        if eh.key_held(VirtualKeyCode::Left) {
+            eh.rotation.x -= eh.rot_time();
         }
-        if event_helper.key_held(VirtualKeyCode::D) {
-            event_helper.position.x += event_helper.mov_time();
+        if eh.key_held(VirtualKeyCode::Right) {
+            eh.rotation.x += eh.rot_time();
         }
-        if event_helper.key_held(VirtualKeyCode::W) {
-            event_helper.position.y += event_helper.mov_time();
+        if eh.key_held(VirtualKeyCode::Up) {
+            eh.rotation.y -= eh.rot_time();
         }
-        if event_helper.key_held(VirtualKeyCode::S) {
-            event_helper.position.y -= event_helper.mov_time();
-        }
-        if event_helper.key_held(VirtualKeyCode::Q) {
-            event_helper.position.z += event_helper.mov_time();
-        }
-        if event_helper.key_held(VirtualKeyCode::E) {
-            event_helper.position.z -= event_helper.mov_time();
+        if eh.key_held(VirtualKeyCode::Down) {
+            eh.rotation.y += eh.rot_time();
         }
 
-        event_helper.rotation.y = event_helper.rotation.y.clamp(-0.5 * PI, 0.5 * PI);
-        push_constants.rot = event_helper.rotation().to_array();
-        push_constants.pos = (Vec3::from(push_constants.pos) + event_helper.position()).to_array();
-        event_helper.position = Vec3::ZERO;
+        if eh.key_held(VirtualKeyCode::A) {
+            eh.position.x -= eh.mov_time();
+        }
+        if eh.key_held(VirtualKeyCode::D) {
+            eh.position.x += eh.mov_time();
+        }
+        if eh.key_held(VirtualKeyCode::W) {
+            eh.position.y += eh.mov_time();
+        }
+        if eh.key_held(VirtualKeyCode::S) {
+            eh.position.y -= eh.mov_time();
+        }
+        if eh.key_held(VirtualKeyCode::Q) {
+            eh.position.z += eh.mov_time();
+        }
+        if eh.key_held(VirtualKeyCode::E) {
+            eh.position.z -= eh.mov_time();
+        }
 
-        event_helper.last_update = Instant::now();
+        eh.rotation.y = eh.rotation.y.clamp(-0.5 * PI, 0.5 * PI);
+        push_constants.rot = eh.rotation().to_array();
+        push_constants.pos = (Vec3::from(push_constants.pos) + eh.position()).to_array();
+        eh.position = Vec3::ZERO;
 
-        // vvv rendering vvv
-        if event_helper.recreate_swapchain || event_helper.window_resized {
-            event_helper.recreate_swapchain = false;
+        eh.last_update = Instant::now();
 
-            let dimensions = event_helper.window().inner_size();
+        // rendering
+        if eh.recreate_swapchain || eh.window_resized {
+            eh.recreate_swapchain = false;
+
+            let dimensions = eh.window().inner_size();
 
             let (new_swapchain, images) = match swapchain.recreate(SwapchainCreateInfo {
                 image_extent: dimensions.into(),
@@ -819,10 +1017,10 @@ fn main() {
 
             framebuffers = get_framebuffers(&images, render_pass.clone());
 
-            if event_helper.window_resized {
-                event_helper.window_resized = false;
+            if eh.window_resized {
+                eh.window_resized = false;
 
-                viewport.dimensions = event_helper.dimensions.to_array();
+                viewport.dimensions = eh.dimensions.to_array();
                 push_constants.view = viewport.dimensions;
 
                 graphics_pipeline = get_graphics_pipeline(
@@ -841,16 +1039,20 @@ fn main() {
                     compute_image_count,
                     viewport.dimensions,
                 );
-                let compute_image_views = get_compute_image_views(device.clone(), queue.clone(), &compute_images);
+                let compute_image_views =
+                    get_compute_image_views(device.clone(), queue.clone(), &compute_images);
 
                 compute_descriptor_set = get_compute_descriptor_set(
                     compute_pipeline.clone(),
                     compute_image_views.clone(),
+                    mutable_buffer.clone(),
                 );
 
                 graphics_descriptor_set = get_graphics_descriptor_set(
                     graphics_pipeline.clone(),
                     compute_image_views[compute_image_count - 1].clone(),
+                    immutable_buffer.clone(),
+                    mutable_buffer.clone(),
                 );
             }
         }
@@ -859,11 +1061,11 @@ fn main() {
             match swapchain::acquire_next_image(swapchain.clone(), None) {
                 Ok(ok) => ok,
                 Err(AcquireError::OutOfDate) => {
-                    return event_helper.recreate_swapchain = true;
+                    return eh.recreate_swapchain = true;
                 }
                 Err(err) => panic!("{}", err),
             };
-        event_helper.recreate_swapchain |= suboptimal;
+        eh.recreate_swapchain |= suboptimal;
 
         if let Some(image_fence) = &fences[image_index] {
             image_fence.wait(None).unwrap();
@@ -875,7 +1077,7 @@ fn main() {
             graphics_pipeline.clone(),
             compute_pipeline.clone(),
             framebuffers[image_index].clone(),
-            &compute_images, // TODO: add compute_image for each framebuffer
+            &compute_images,
             compute_image_count,
             push_constants.clone(),
             graphics_descriptor_set.clone(),
@@ -901,7 +1103,7 @@ fn main() {
         fences[image_index] = match future {
             Ok(ok) => Some(Arc::new(ok)),
             Err(FlushError::OutOfDate) => {
-                event_helper.recreate_swapchain = true;
+                eh.recreate_swapchain = true;
                 None
             }
             Err(err) => {
