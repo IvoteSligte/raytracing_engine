@@ -43,303 +43,25 @@ use winit::{
 };
 use winit_event_helper::EventHelper;
 
-mod vertex_shader {
+// TODO: increase first direct image resolution
+mod shaders {
     vulkano_shaders::shader! {
-        ty: "vertex",
-        src: "
-#version 460
-
-vec2 positions[3] = vec2[](
-    vec2(-1.0, -1.0),
-    vec2(3.0, -1.0),
-    vec2(-1.0, 3.0)
-);
-
-void main() {
-    gl_Position = vec4(positions[gl_VertexIndex], 0.0, 1.0);
-}
-        "
-    }
-}
-
-mod fragment_shader {
-    vulkano_shaders::shader! {
-        ty: "fragment",
+        shaders: {
+            Vertex: {
+                ty: "vertex",
+                path: "shaders/vertex.glsl",
+            },
+            Fragment: {
+                ty: "fragment",
+                path: "shaders/fragment.glsl",
+            },
+            Compute: {
+                ty: "compute",
+                path: "shaders/compute.glsl",
+            },
+        },
         types_meta: { #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)] },
-        src: "
-#version 460
-
-layout(location = 0) out vec4 fragColor;
-
-layout(push_constant) uniform PushConstantData {
-    vec4 rot;
-    vec3 pos;
-    vec2 view;
-} pc;
-
-// direct depth image (compute)
-layout(binding = 0, r32f) uniform readonly image2D img;
-
-// materials
-const uint MAX_MATERIALS = 8;
-
-struct Material {
-    vec3 color;
-    float diffuse;
-    float specular;
-    float shine;
-};
-
-// material
-layout(binding = 1) uniform readonly ImmutableData {
-    // TODO: implement object-material indexing
-    Material mats[MAX_MATERIALS];
-} buf;
-
-// objects
-const uint MAX_OBJECTS = 8;
-
-struct Object {
-    vec3 pos;
-    float size;
-};
-
-layout(binding = 2) uniform readonly MutableData {
-    uint matCount;
-    uint objCount;
-    Object objs[MAX_OBJECTS];
-} mutBuf;
-
-// scene
-const float ambientScene = 0.2;
-
-// camera
-const float renderDist = 1000.0;
-const float camFallOffFactor = 0.01;
-
-// light
-// TODO: implement multiple light source support
-vec4 light = vec4(4.0, 2.0, 2.0, 1.0); // w = strength
-const float lightFallOffFactor = 0.01;
-
-vec3 rotate(vec4 q, vec3 v) {
-    vec3 t = cross(q.xyz, v) + q.w * v;
-    return v + 2.0 * cross(q.xyz, t);
-}
-
-// iq infinite repetition
-vec3 repeat(vec3 p, vec3 r) {
-    return mod(p + 0.5*r, r) - 0.5*r;
-}
-
-float diffuse(vec3 normal, vec3 lightDir) {
-    return max(dot(normal, lightDir), 0.0);
-}
-
-float specular(vec3 normal, vec3 lightDir, vec3 camDir, float diffuse, float shine) {
-    vec3 reflection = reflect(-lightDir, normal);
-    return diffuse * pow(max(dot(reflection, camDir), 0.0), shine);
-}
-
-float sphereSDF(vec3 p, Object s) {
-    return distance(p, s.pos) - s.size;
-}
-
-// TODO: implement custom FOVs
-void main() {
-    // maps FragCoord to xy range [-1.0, 1.0]
-    vec2 normCoord = gl_FragCoord.xy * 2 / pc.view - 1.0;
-    // assuming height <= width, width = 1.0 and height <= 1.0
-    normCoord.y *= pc.view.y / pc.view.x; // TODO: move to CPU
-
-    vec3 step = normalize(rotate(pc.rot, vec3(normCoord.x, 1.0, normCoord.y)));
-
-    float totalDist = imageLoad(img, ivec2(gl_FragCoord.xy)).x;
-
-    if (totalDist >= renderDist) {
-        fragColor.xyz = vec3(0.0);
-        return;
-    }
-
-    vec3 position = pc.pos + step * totalDist;
-
-    Object object = mutBuf.objs[0];
-    Material mat = buf.mats[0];
-    float dist = sphereSDF(position, object);
-
-    for (uint i = 1; i < mutBuf.objCount; i++) {
-        Object newObject = mutBuf.objs[i];
-        float newDist = sphereSDF(position, newObject);
-        if (newDist < dist) {
-            object = newObject;
-            dist = newDist;
-            mat = buf.mats[i];
-        }
-    }
-
-    // light
-    vec3 lightDir = normalize(light.xyz - position);
-
-    float lightDist = distance(position, light.xyz);
-    float lightDistFallOff = max(lightFallOffFactor * lightDist * lightDist, 0.1);
-
-    // camera
-    float camDist = distance(position, pc.pos);
-    float camDistFallOff = max(camFallOffFactor * (camDist * camDist + 1.0), 1.0);
-
-    // object
-    // WARNING: only works for spheres
-    vec3 normal = normalize(position - object.pos);
-    
-    float diffuse = diffuse(normal, lightDir);
-    float specular = specular(normal, lightDir, -step, diffuse, mat.shine);
-
-    float direct = max(diffuse + specular, 0.0) * light.w / lightDistFallOff;
-
-    fragColor.xyz = (ambientScene + direct) / camDistFallOff * dot(normal, -step) * mat.color;
-}"
-    }
-}
-
-// TODO: increase initial resolution to MAX_RES / 16 or MAX_RES / 32
-mod compute_shader {
-    vulkano_shaders::shader! {
-        ty: "compute",
-        types_meta: { #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)] },
-        src: "
-#version 460
-
-layout(local_size_x = 8, local_size_y = 8) in;
-
-layout(push_constant) uniform PushConstantData {
-    vec4 rot;
-    vec3 pos;
-    uint iter;
-    vec2 view;
-    uint max_img; // highest image index
-} pc;
-
-// 9 images allows for a maximum resolution of 2048x2048 pixels
-layout(binding = 0, r32f) uniform image2D imgs[9];
-
-// objects
-const uint MAX_OBJECTS = 8;
-
-struct Object {
-    vec3 pos;
-    float size;
-};
-
-layout(binding = 1) uniform readonly MutableData {
-    uint matCount;
-    uint objCount;
-    Object objs[MAX_OBJECTS];
-} mutBuf;
-
-// camera
-const float renderDist = 1000.0;
-
-vec3 rotate(vec4 q, vec3 v) {
-    vec3 t = cross(q.xyz, v) + q.w * v;
-    return v + 2.0 * cross(q.xyz, t);
-}
-
-// p = point, r = repetition radius
-vec3 repeat(vec3 p, vec3 r) {
-    return mod(p + 0.5*r, r) - 0.5*r;
-}
-
-float sphereSDF(vec3 p, Object s) {
-    return distance(p, s.pos) - s.size;
-}
-
-// TODO: make cpu provide general values
-void main() {
-    uint unitSize = 1 << (pc.max_img - pc.iter); // TODO: move to CPU
-
-    vec2 normCoord = ((gl_GlobalInvocationID.xy * 2 + 1) * unitSize) / pc.view - 1.0;
-    normCoord.y *= pc.view.y / pc.view.x; // TODO: move to CPU
-
-    // sqrt(2) * (nearest ceil base 2 of image width) / (screen width in pixels)
-    float thresholdDist = 1.4142135 * gl_WorkGroupSize.x * unitSize / pc.view.x; // TODO: move to CPU
-
-    vec3 step = normalize(rotate(pc.rot, vec3(normCoord.x, 1.0, normCoord.y)));
-
-    float totalDist = 1.0;
-    if (pc.iter > 0) {
-        totalDist = imageLoad(imgs[pc.iter - 1], ivec2(gl_GlobalInvocationID.xy * 0.5)).r;
-    }
-
-    float distances[MAX_OBJECTS];
-
-    for (uint i = 0; i < mutBuf.objCount; i++) {
-        distances[i] = 0.0;
-    }
-
-    uint closest = 0;
-    float nearest = 0.0;
-
-    //for (uint j = 0; j < 100; j++) {
-    while (totalDist < renderDist) {
-        vec3 position = pc.pos + step * totalDist;
-
-        
-        // algorithm 3
-        float dist = 1000000.0;
-        // multiplying by 2.0 ''fixes'' a bug
-        float radius = (totalDist + 1.0) * thresholdDist;
-        for (uint i = 0; i < mutBuf.objCount; i++) {
-            distances[i] -= nearest;
-            if (distances[i] <= radius + nearest) {
-                distances[i] = sphereSDF(position, mutBuf.objs[i]);
-            }
-            dist = min(dist, distances[i]);
-        }
-        nearest = max(dist, 0.0);
-
-        totalDist += nearest;
-        radius = (totalDist + 1.0) * thresholdDist;
-        if (dist <= radius) {
-            totalDist -= radius;
-            break;
-        }
-        
-
-        // // algorithm 2: only checks real distance when necessary
-        // for (uint i = 0; i < mutBuf.objCount; i++) {
-        //     distances[i] -= nearest;
-        //     if (distances[i] < distances[closest]) {
-        //         closest = i;
-        //     }
-        // }
-
-        // nearest = distances[closest];
-        // totalDist += nearest;
-        // distances[closest] = sphereSDF(position, mutBuf.objs[closest]);
-        
-        // float radius = (totalDist + 1.0) * thresholdDist;
-        // if (distances[closest] <= radius) {
-        //     totalDist += distances[closest] - radius;
-        //     break;
-        // }
-
-        
-        // algorithm 1: checks real distance for each object every update
-        // float dist = sphereSDF(position, mutBuf.objs[0]);
-        // for (uint i = 1; i < mutBuf.objCount; i++) {
-        //     float newDist = sphereSDF(position, mutBuf.objs[i]);
-        //     dist = min(dist, newDist);
-        // }
-
-        // totalDist += dist;
-        // float radius = (totalDist + 1.0) * thresholdDist;
-        // if (dist <= radius) {
-        //     totalDist -= radius;
-        //     break;
-        // }
-    }
-    imageStore(imgs[pc.iter], ivec2(gl_GlobalInvocationID.xy), vec4(max(totalDist, 0.0)));
-}"
+        include: ["shaders/utilities.glsl"],
     }
 }
 
@@ -413,12 +135,16 @@ fn get_graphics_pipeline(
     fragment_shader: Arc<ShaderModule>,
     viewport: Viewport,
     render_pass: Arc<RenderPass>,
+    fragment_spec_consts: shaders::FragmentSpecializationConstants,
 ) -> Arc<GraphicsPipeline> {
     GraphicsPipeline::start()
         .vertex_input_state(VertexInputState::new())
         .vertex_shader(vertex_shader.entry_point("main").unwrap(), ())
         .input_assembly_state(InputAssemblyState::new()) // might be unnecessary
-        .fragment_shader(fragment_shader.entry_point("main").unwrap(), ())
+        .fragment_shader(
+            fragment_shader.entry_point("main").unwrap(),
+            fragment_spec_consts,
+        )
         .viewport_state(ViewportState::viewport_fixed_scissor_irrelevant([viewport]))
         .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
         .build(device.clone())
@@ -428,11 +154,12 @@ fn get_graphics_pipeline(
 fn get_compute_pipeline(
     device: Arc<Device>,
     compute_shader: Arc<ShaderModule>,
+    spec_consts: shaders::ComputeSpecializationConstants,
 ) -> Arc<ComputePipeline> {
     ComputePipeline::new(
         device.clone(),
         compute_shader.entry_point("main").unwrap(),
-        &(),
+        &spec_consts,
         None,
         |_| {},
     )
@@ -442,15 +169,15 @@ fn get_compute_pipeline(
 fn get_graphics_descriptor_set(
     pipeline: Arc<GraphicsPipeline>,
     image_view: Arc<dyn ImageViewAbstract>,
-    immutable_buffer: Arc<dyn BufferAccess>,
     mutable_buffer: Arc<dyn BufferAccess>,
+    constant_buffer: Arc<dyn BufferAccess>,
 ) -> Arc<PersistentDescriptorSet> {
     PersistentDescriptorSet::new(
         pipeline.layout().set_layouts()[0].clone(),
         [
             WriteDescriptorSet::image_view(0, image_view.clone()),
-            WriteDescriptorSet::buffer(1, immutable_buffer),
-            WriteDescriptorSet::buffer(2, mutable_buffer),
+            WriteDescriptorSet::buffer(1, mutable_buffer),
+            WriteDescriptorSet::buffer(2, constant_buffer),
         ],
     )
     .unwrap()
@@ -460,12 +187,14 @@ fn get_compute_descriptor_set(
     pipeline: Arc<ComputePipeline>,
     image_views: Vec<Arc<dyn ImageViewAbstract>>,
     mutable_buffer: Arc<dyn BufferAccess>,
+    constant_buffer: Arc<dyn BufferAccess>,
 ) -> Arc<PersistentDescriptorSet> {
     PersistentDescriptorSet::new(
         pipeline.layout().set_layouts()[0].clone(),
         [
             WriteDescriptorSet::image_view_array(0, 0, image_views),
             WriteDescriptorSet::buffer(1, mutable_buffer),
+            WriteDescriptorSet::buffer(2, constant_buffer),
         ],
     )
     .unwrap()
@@ -544,7 +273,8 @@ fn get_command_buffer<S>(
     framebuffer: Arc<Framebuffer>,
     compute_images: &Vec<Arc<StorageImage>>,
     compute_image_count: usize,
-    push_constants: fragment_shader::ty::PushConstantData,
+    push_constants: shaders::ty::PushConstantData,
+    constants: shaders::ty::ConstantBuffer,
     graphics_descriptor_set: S,
     compute_descriptor_set: S,
 ) -> Arc<PrimaryAutoCommandBuffer>
@@ -568,12 +298,12 @@ where
         );
 
     for (image, i) in compute_images.iter().zip(0..compute_image_count) {
-        let compute_pc = compute_shader::ty::PushConstantData {
-            rot: push_constants.rot,
-            pos: push_constants.pos,
+        let compute_pc = shaders::ty::PushConstantData {
             iter: i as u32,
-            view: push_constants.view,
-            max_img: compute_image_count as u32 - 1,
+            imageSize: ((1 << (compute_image_count - 1 - i)) as f32
+                / Vec2::from_array(constants.view))
+            .to_array(),
+            ..push_constants
         };
         let [w, h] = image.dimensions().width_height(); // assumes depth = 1
 
@@ -627,6 +357,11 @@ mod rotation {
 }
 
 const COMPUTE_IMAGE_COUNT: usize = 9;
+
+// distance from the camera at which the ray gets cut off
+const RENDER_DIST: f32 = 1000.0;
+// field of view
+const FOV: f32 = 1.0;
 
 struct Data<W> {
     /// the window surface
@@ -703,6 +438,7 @@ fn main() {
         // WARNING: not supported on Mac, web and mobile platforms
         .set_cursor_grab(CursorGrabMode::Confined)
         .unwrap();
+    surface.window().set_resizable(false);
 
     let device_extensions = DeviceExtensions {
         khr_swapchain: true,
@@ -738,7 +474,11 @@ fn main() {
             .unwrap()
             .iter()
             .max_by_key(|(format, _)| match format {
-                Format::R8G8B8A8_SRGB | Format::B8G8R8A8_SRGB => 1,
+                // any R8G8B8A8_.NORM variant
+                Format::R8G8B8A8_UNORM
+                | Format::R8G8B8A8_SNORM
+                | Format::B8G8R8A8_UNORM
+                | Format::B8G8R8A8_SNORM => 1,
                 _ => 0,
             })
             .unwrap()
@@ -763,8 +503,8 @@ fn main() {
 
     let mut framebuffers = get_framebuffers(&swapchain_images, render_pass.clone());
 
-    let vertex_shader = vertex_shader::load(device.clone()).unwrap();
-    let fragment_shader = fragment_shader::load(device.clone()).unwrap();
+    let vertex_shader = shaders::load_Vertex(device.clone()).unwrap();
+    let fragment_shader = shaders::load_Fragment(device.clone()).unwrap();
 
     let mut viewport = Viewport {
         origin: [0.0, 0.0],
@@ -778,90 +518,123 @@ fn main() {
         fragment_shader.clone(),
         viewport.clone(),
         render_pass.clone(),
+        shaders::FragmentSpecializationConstants { RENDER_DIST },
     );
 
-    const MATERIALS: [fragment_shader::ty::Material; 4] = [
-        fragment_shader::ty::Material {
+    let materials: [shaders::ty::Material; 4] = [
+        shaders::ty::Material {
             color: [0.2, 0.2, 1.0],
             diffuse: 1.0,
             specular: 1.0,
             shine: 1.0,
-            _dummy0: [0u8; 8],
+            ambient: 0.05,
+            _dummy0: [0u8; 4],
         },
-        fragment_shader::ty::Material {
-            color: [0.0, 1.0, 0.0],
+        shaders::ty::Material {
+            color: [0.1, 1.0, 0.1],
+            diffuse: 1.0,
+            specular: 1.0,
+            shine: 10.0,
+            ambient: 0.05,
+            _dummy0: [0u8; 4],
+        },
+        shaders::ty::Material {
+            color: [1.0, 1.0, 0.1],
             diffuse: 1.0,
             specular: 1.0,
             shine: 1.0,
-            _dummy0: [0u8; 8],
+            ambient: 0.05,
+            _dummy0: [0u8; 4],
         },
-        fragment_shader::ty::Material {
-            color: [1.0, 1.0, 0.0],
+        shaders::ty::Material {
+            color: [1.0, 0.1, 0.1],
             diffuse: 1.0,
             specular: 1.0,
             shine: 1.0,
-            _dummy0: [0u8; 8],
-        },
-        fragment_shader::ty::Material {
-            color: [1.0, 0.0, 0.0],
-            diffuse: 1.0,
-            specular: 1.0,
-            shine: 1.0,
-            _dummy0: [0u8; 8],
+            ambient: 0.05,
+            _dummy0: [0u8; 4],
         },
     ];
 
-    let (immutable_buffer, immutable_future) =
-        DeviceLocalBuffer::from_data(MATERIALS, BufferUsage::uniform_buffer(), queue.clone())
-            .unwrap();
-
     let objects = [
-        fragment_shader::ty::Object {
-            pos: [3.0, 5.0, -1.0],
+        shaders::ty::Object {
+            pos: [5.0, 5.0, -1.0],
             size: 3.0,
         },
-        fragment_shader::ty::Object {
-            pos: [5.0, 4.0, 5.0],
+        shaders::ty::Object {
+            pos: [5.0, 4.0, 10.0],
             size: 6.0,
         },
-        fragment_shader::ty::Object {
-            pos: [-0.0, 3.0, -0.0],
+        shaders::ty::Object {
+            pos: [-3.0, 3.0, -3.0],
             size: 1.0,
         },
-        fragment_shader::ty::Object {
-            pos: [4.0, 1.0, 0.0],
+        shaders::ty::Object {
+            pos: [4.0, -1.0, 0.0],
             size: 2.0,
         },
     ];
 
-    let mut mutable_data = fragment_shader::ty::MutableData {
-        matCount: MATERIALS.len() as u32,
+    let lights = [
+        shaders::ty::Light {
+            pos: [-1.0, 0.0, -3.0],
+            _dummy0: [0u8; 4],
+            color: [0.1, 0.5, 0.6],
+            _dummy1: [0u8; 4],
+        },
+        shaders::ty::Light {
+            pos: [8.0, -5.0, 10.0],
+            _dummy0: [0u8; 4],
+            color: [1.2, 0.2, 0.3],
+            _dummy1: [0u8; 4],
+        },
+    ];
+
+    let mut mutable_data = shaders::ty::MutableData {
+        matCount: materials.len() as u32,
         objCount: objects.len() as u32,
+        lightCount: lights.len() as u32,
         ..Default::default()
     };
+    mutable_data.mats[..materials.len()].copy_from_slice(&materials);
     mutable_data.objs[..objects.len()].copy_from_slice(&objects);
-    
+    mutable_data.lights[..lights.len()].copy_from_slice(&lights);
+
     let (mutable_buffer, mutable_future) =
         DeviceLocalBuffer::from_data(mutable_data, BufferUsage::uniform_buffer(), queue.clone())
             .unwrap();
 
-    immutable_future
-        .join(mutable_future)
+    // near constant data
+    let mut constant_data = shaders::ty::ConstantBuffer {
+        view: viewport.dimensions,
+        ratio: [FOV, FOV * viewport.dimensions[1] / viewport.dimensions[0]],
+    };
+
+    let (constant_buffer, constant_future) =
+        DeviceLocalBuffer::from_data(constant_data, BufferUsage::uniform_buffer(), queue.clone())
+            .unwrap();
+
+    mutable_future
+        .join(constant_future)
         .then_signal_fence_and_flush()
         .unwrap()
         .wait(None)
         .unwrap();
 
-    let mut push_constants = fragment_shader::ty::PushConstantData {
+    let mut push_constants = shaders::ty::PushConstantData {
         rot: [0.0, 0.0, 0.0, 0.0],
         pos: [0.0, 0.0, 0.0],
-        view: viewport.dimensions,
-        _dummy0: [0u8; 4],
+        iter: 0,
+        imageSize: [1.0; 2],
     };
 
-    let compute_shader = compute_shader::load(device.clone()).unwrap();
+    let compute_shader = shaders::load_Compute(device.clone()).unwrap();
 
-    let compute_pipeline = get_compute_pipeline(device.clone(), compute_shader.clone());
+    let compute_pipeline = get_compute_pipeline(
+        device.clone(),
+        compute_shader.clone(),
+        shaders::ComputeSpecializationConstants { RENDER_DIST },
+    );
 
     let mut compute_image_count = (viewport.dimensions[0] / 8.0).log2() as usize + 1;
 
@@ -877,14 +650,15 @@ fn main() {
     let mut graphics_descriptor_set = get_graphics_descriptor_set(
         graphics_pipeline.clone(),
         compute_image_views[compute_image_count - 1].clone(),
-        immutable_buffer.clone(),
         mutable_buffer.clone(),
+        constant_buffer.clone(),
     );
 
     let mut compute_descriptor_set = get_compute_descriptor_set(
         compute_pipeline.clone(),
         compute_image_views.clone(),
         mutable_buffer.clone(),
+        constant_buffer.clone(),
     );
 
     let mut command_buffers = vec![None; framebuffers.len()];
@@ -960,6 +734,7 @@ fn main() {
 
         eh.cursor_delta = Vec2::ZERO;
 
+        // TODO: make movement independent of framerate
         if eh.key_held(VirtualKeyCode::Left) {
             eh.rotation.x -= eh.rot_time();
         }
@@ -1021,7 +796,42 @@ fn main() {
                 eh.window_resized = false;
 
                 viewport.dimensions = eh.dimensions.to_array();
-                push_constants.view = viewport.dimensions;
+
+                constant_data = shaders::ty::ConstantBuffer {
+                    view: viewport.dimensions,
+                    ratio: [FOV, FOV * viewport.dimensions[1] / viewport.dimensions[0]],
+                };
+
+                // TODO: make this a lot cleaner
+                let mut builder = AutoCommandBufferBuilder::primary(
+                    device.clone(),
+                    queue.family(),
+                    CommandBufferUsage::OneTimeSubmit,
+                )
+                .unwrap();
+
+                builder
+                    .update_buffer(Box::new(constant_data), constant_buffer.clone(), 0)
+                    .unwrap();
+                let command_buffer = builder.build().unwrap();
+
+                match fences[previous_fence_index].clone() {
+                    Some(future) => {
+                        future
+                            .then_signal_fence_and_flush()
+                            .unwrap()
+                            .wait(None)
+                            .unwrap();
+                        sync::now(device.clone())
+                            .then_execute(queue.clone(), command_buffer)
+                            .unwrap()
+                            .then_signal_fence_and_flush()
+                            .unwrap()
+                            .wait(None)
+                            .unwrap();
+                    }
+                    None => (),
+                }
 
                 graphics_pipeline = get_graphics_pipeline(
                     device.clone(),
@@ -1029,6 +839,7 @@ fn main() {
                     fragment_shader.clone(),
                     viewport.clone(),
                     render_pass.clone(),
+                    shaders::FragmentSpecializationConstants { RENDER_DIST },
                 );
 
                 compute_image_count = (viewport.dimensions[0] / 8.0).log2().ceil() as usize + 1;
@@ -1046,13 +857,14 @@ fn main() {
                     compute_pipeline.clone(),
                     compute_image_views.clone(),
                     mutable_buffer.clone(),
+                    constant_buffer.clone(),
                 );
 
                 graphics_descriptor_set = get_graphics_descriptor_set(
                     graphics_pipeline.clone(),
                     compute_image_views[compute_image_count - 1].clone(),
-                    immutable_buffer.clone(),
                     mutable_buffer.clone(),
+                    constant_buffer.clone(),
                 );
             }
         }
@@ -1080,6 +892,7 @@ fn main() {
             &compute_images,
             compute_image_count,
             push_constants.clone(),
+            constant_data.clone(),
             graphics_descriptor_set.clone(),
             compute_descriptor_set.clone(),
         ));

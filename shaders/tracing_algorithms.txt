@@ -1,0 +1,60 @@
+
+// algorithm 1: checks real distance for each object every update
+float dist = sphereSDF(position, buf.objs[0]);
+for (uint i = 1; i < buf.objCount; i++) {
+    dist = min(dist, sphereSDF(position, buf.objs[i]));
+}
+
+totalDist += dist;
+float radius = (totalDist + 1.0) * thresholdDist;
+if (dist <= radius) {
+    totalDist -= radius;
+    break;
+}
+
+
+// algorithm 2: only checks real distance when necessary
+
+// OUTSIDE LOOP
+uint closest = 0;
+float nearest = 0.0;
+
+for (uint i = 0; i < buf.objCount; i++) {
+    distances[i] -= nearest;
+    if (distances[i] < distances[closest]) {
+        closest = i;
+    }
+}
+
+nearest = distances[closest];
+totalDist += nearest;
+distances[closest] = sphereSDF(position, buf.objs[closest]);
+
+float radius = (totalDist + 1.0) * thresholdDist;
+if (distances[closest] <= radius) {
+    totalDist += distances[closest] - radius;
+    break;
+}
+
+
+// algorithm 3: same as algorithm 2, but a different implementation
+
+// OUTSIDE LOOP
+float nearest = 0.0;
+
+float dist = 1000000.0;
+float radius = (totalDist + 1.0) * thresholdDist;
+for (uint i = 0; i < buf.objCount; i++) {
+    distances[i] -= nearest;
+    if (distances[i] <= radius + nearest) {
+        distances[i] = sphereSDF(position, buf.objs[i]);
+    }
+    dist = min(dist, distances[i]);
+}
+nearest = max(dist, 0.0);
+
+totalDist += nearest;
+if (dist <= radius) {
+    totalDist -= radius;
+    break;
+}
